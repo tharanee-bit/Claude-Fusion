@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.codex/hooks/claude-fusion-userprompt.sh",
+            "timeout": 660
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOME/.codex/hooks/claude-fusion-stop.sh",
+            "timeout": 660
+          }
+        ]
+      }
+    ]
+  }
+}

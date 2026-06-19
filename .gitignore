@@ -1,0 +1,6 @@
+# hooks.json backups created by install/uninstall
+*.claude-fusion.bak
+
+# OS cruft
+.DS_Store
+Thumbs.db

@@ -1,0 +1,17 @@
+# Manual fallback: append these tables to ~/.codex/config.toml instead of using ~/.codex/hooks.json.
+# (The installer writes ~/.codex/hooks.json, which is non-destructive. Use this only if you prefer
+# to keep hooks inside config.toml. Both load paths are equivalent; do not define the same hook twice.)
+#
+# Replace $HOME with your absolute home path if Codex does not expand it.
+
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "$HOME/.codex/hooks/claude-fusion-userprompt.sh"
+timeout = 660
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "$HOME/.codex/hooks/claude-fusion-stop.sh"
+timeout = 660
