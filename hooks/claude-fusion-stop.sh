@@ -31,6 +31,14 @@ CLAUDE_MODEL="${CLAUDE_FUSION_MODEL:-opus}"
 CLAUDE_EFFORT="${CLAUDE_FUSION_EFFORT:-xhigh}"
 DEPTH="${CLAUDE_FUSION_DEPTH:-workflow}"
 TOOLSMODE="${CLAUDE_FUSION_TOOLS:-readonly}"
+SAFE_MODE="${CLAUDE_FUSION_SAFE_MODE:-1}"
+CLAUDE_SAFE_ARGS=(--safe-mode)
+case "$SAFE_MODE" in
+  0|false|False|FALSE|no|No|NO|off|Off|OFF) CLAUDE_SAFE_ARGS=();;
+esac
+CUSTOM_CLAUDE_CONTEXT=0
+[ "${#CLAUDE_SAFE_ARGS[@]}" -eq 0 ] && CUSTOM_CLAUDE_CONTEXT=1
+claude_supports_safe_mode(){ timeout 10 "$CLAUDE_BIN" --help 2>&1 | grep -q -- '--safe-mode'; }
 if [ "$DEPTH" = "workflow" ]; then DEF_TIMEOUT=600; else DEF_TIMEOUT=300; fi
 CLAUDE_TIMEOUT="${CLAUDE_FUSION_TIMEOUT:-$DEF_TIMEOUT}"
 
@@ -62,12 +70,26 @@ CHANGED="$(git -C "$CWD" status --short 2>/dev/null | head -c 3000)"
 # NOTE: the marker is deleted only on a DEFINITIVE outcome (PASS, or a delivered ISSUES_FOUND block),
 # not here. A transient failure leaves it so the next genuine Stop retries the review.
 
+if [ "${#CLAUDE_SAFE_ARGS[@]}" -gt 0 ] && ! claude_supports_safe_mode; then
+  dbg "claude lacks --safe-mode -> exit (marker kept; update Claude Code or set CLAUDE_FUSION_SAFE_MODE=0)"
+  exit 0
+fi
+
 WF_NOTE=""
-[ "$DEPTH" = "workflow" ] && WF_NOTE="
+if [ "$DEPTH" = "workflow" ] && [ "$CUSTOM_CLAUDE_CONTEXT" -eq 1 ]; then
+  WF_NOTE="
 You may run a READ-ONLY multi-agent adversarial review (dynamic workflows / parallel subagents) for
 deeper coverage. Do not edit files or run mutating commands."
+elif [ "$DEPTH" = "workflow" ]; then
+  WF_NOTE="
+Run a thorough READ-ONLY review rather than a single quick pass. Claude Fusion is running you in
+--safe-mode, so do not rely on user/project Claude customizations, skills, plugins, workflows,
+memory, MCP servers, or custom agents."
+fi
 
-CLAUDE_PROMPT="$([ "$DEPTH" = "workflow" ] && printf 'ultracode: ')You are Claude acting as an independent code reviewer for the OpenAI Codex agent.
+CLAUDE_PREFIX=""
+[ "$DEPTH" = "workflow" ] && [ "$CUSTOM_CLAUDE_CONTEXT" -eq 1 ] && CLAUDE_PREFIX="ultracode: "
+CLAUDE_PROMPT="${CLAUDE_PREFIX}You are Claude acting as an independent code reviewer for the OpenAI Codex agent.
 You are running automatically from a Codex Stop hook, in READ-ONLY mode.
 Do not edit files. Do not run destructive commands.
 Do not inspect credentials, tokens, .env files, keychains, shell history, or auth files.$WF_NOTE
@@ -99,10 +121,10 @@ if [ "$TOOLSMODE" = "none" ]; then
   CLAUDE_TOOL_ARGS=(--tools "")
 else
   ALLOW="Read Grep Glob Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(git show:*) Bash(ls:*) Bash(cat:*)"
-  [ "$DEPTH" = "workflow" ] && ALLOW="$ALLOW Task Workflow ToolSearch"
+  [ "$DEPTH" = "workflow" ] && [ "$CUSTOM_CLAUDE_CONTEXT" -eq 1 ] && ALLOW="$ALLOW Task Workflow ToolSearch"
   CLAUDE_TOOL_ARGS=(--allowedTools "$ALLOW")
 fi
-CLAUDE_ARGS=(-p --permission-mode plan --no-session-persistence --output-format text)
+CLAUDE_ARGS=(-p "${CLAUDE_SAFE_ARGS[@]}" --permission-mode plan --no-session-persistence --output-format text)
 [ -n "$CLAUDE_MODEL" ] && CLAUDE_ARGS+=(--model "$CLAUDE_MODEL")
 [ -n "$CLAUDE_EFFORT" ] && CLAUDE_ARGS+=(--effort "$CLAUDE_EFFORT")
 CLAUDE_ARGS+=("${CLAUDE_TOOL_ARGS[@]}")
@@ -115,7 +137,7 @@ dbg "running claude review (model=$CLAUDE_MODEL, effort=$CLAUDE_EFFORT, depth=$D
 REVIEW="$(run_claude)"; RC=$?
 if { [ "$RC" -ne 0 ] || [ -z "$REVIEW" ]; } && [ "$RC" -ne 124 ]; then
   dbg "claude rc=$RC / empty; retrying with default model+effort (sandbox preserved)"
-  CLAUDE_ARGS=(-p --permission-mode plan --no-session-persistence --output-format text "${CLAUDE_TOOL_ARGS[@]}")
+  CLAUDE_ARGS=(-p "${CLAUDE_SAFE_ARGS[@]}" --permission-mode plan --no-session-persistence --output-format text "${CLAUDE_TOOL_ARGS[@]}")
   REVIEW="$(run_claude)"; RC=$?
 fi
 # On a transient failure, KEEP the marker so the next genuine Stop retries the review.

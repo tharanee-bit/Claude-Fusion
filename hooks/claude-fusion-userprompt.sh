@@ -32,12 +32,20 @@ case ":$PATH:" in *":$_cl_dir:"*) ;; *) export PATH="$_cl_dir:$PATH";; esac
 
 MAX_CHARS=12000
 # Claude Fusion runs Claude on the strongest model at extra-high (xhigh) effort and, by default,
-# lets it orchestrate a read-only multi-agent analysis (ultracode / dynamic workflows). Override via env.
+# isolates Claude's local customizations so automatic consults stay task-scoped. Override via env.
 CLAUDE_MODEL="${CLAUDE_FUSION_MODEL:-opus}"      # latest Opus by alias; bump when a stronger model ships
 CLAUDE_EFFORT="${CLAUDE_FUSION_EFFORT:-xhigh}"   # low / medium / high / xhigh / max
-DEPTH="${CLAUDE_FUSION_DEPTH:-workflow}"         # workflow (ultracode multi-agent) | single (one-shot)
+DEPTH="${CLAUDE_FUSION_DEPTH:-workflow}"         # workflow (deeper pass) | single (one-shot)
 TOOLSMODE="${CLAUDE_FUSION_TOOLS:-readonly}"     # readonly (explore repo) | none (--tools "", baked-in only)
-# Workflow/ultracode analyses are slow; give them headroom. The internal timeout bounds the claude call;
+SAFE_MODE="${CLAUDE_FUSION_SAFE_MODE:-1}"        # 1 isolates Claude customizations; 0 allows CLAUDE.md/memory/skills/workflows
+CLAUDE_SAFE_ARGS=(--safe-mode)
+case "$SAFE_MODE" in
+  0|false|False|FALSE|no|No|NO|off|Off|OFF) CLAUDE_SAFE_ARGS=();;
+esac
+CUSTOM_CLAUDE_CONTEXT=0
+[ "${#CLAUDE_SAFE_ARGS[@]}" -eq 0 ] && CUSTOM_CLAUDE_CONTEXT=1
+claude_supports_safe_mode(){ timeout 10 "$CLAUDE_BIN" --help 2>&1 | grep -q -- '--safe-mode'; }
+# Workflow-depth analyses are slow; give them headroom. The internal timeout bounds the claude call;
 # the hook-registration timeout in hooks.json must sit comfortably above it (see install.sh / README).
 if [ "$DEPTH" = "workflow" ]; then DEF_TIMEOUT=600; else DEF_TIMEOUT=300; fi
 CLAUDE_TIMEOUT="${CLAUDE_FUSION_TIMEOUT:-$DEF_TIMEOUT}"
@@ -102,6 +110,11 @@ if [ "$WORDS" -lt 16 ] && printf '%s' "$FIRSTLINE" | grep -iqE "$QUESTION_RE" &&
 fi
 # -> everything else TRIGGERS Claude
 
+if [ "${#CLAUDE_SAFE_ARGS[@]}" -gt 0 ] && ! claude_supports_safe_mode; then
+  dbg "skip: claude lacks --safe-mode; update Claude Code or set CLAUDE_FUSION_SAFE_MODE=0 to allow local Claude customizations"
+  exit 0
+fi
+
 # Gate says complex -> mark this session NOW, before consulting Claude, so the Stop hook still
 # reviews the resulting diff even if this pre-edit analysis later times out or errors.
 [ -n "$SESSION_ID" ] && ensure_state_dir && : >"$STATE_DIR/$SESSION_ID.complex" 2>/dev/null
@@ -110,11 +123,20 @@ GITSTATUS="$(git -C "$CWD" status --short 2>/dev/null | head -c 4000)"
 [ -n "$GITSTATUS" ] || GITSTATUS="(clean or not a git repository)"
 
 WF_NOTE=""
-[ "$DEPTH" = "workflow" ] && WF_NOTE="
+if [ "$DEPTH" = "workflow" ] && [ "$CUSTOM_CLAUDE_CONTEXT" -eq 1 ]; then
+  WF_NOTE="
 When the task is non-trivial, run a thorough READ-ONLY multi-agent analysis (dynamic workflows /
 parallel subagents) rather than a single quick pass. Do not edit files or run mutating commands."
+elif [ "$DEPTH" = "workflow" ]; then
+  WF_NOTE="
+When the task is non-trivial, run a thorough READ-ONLY analysis rather than a single quick pass.
+Claude Fusion is running you in --safe-mode, so do not rely on user/project Claude customizations,
+skills, plugins, workflows, memory, MCP servers, or custom agents."
+fi
 
-CLAUDE_PROMPT="$([ "$DEPTH" = "workflow" ] && printf 'ultracode: ')You are Claude acting as an independent coding peer for the OpenAI Codex agent.
+CLAUDE_PREFIX=""
+[ "$DEPTH" = "workflow" ] && [ "$CUSTOM_CLAUDE_CONTEXT" -eq 1 ] && CLAUDE_PREFIX="ultracode: "
+CLAUDE_PROMPT="${CLAUDE_PREFIX}You are Claude acting as an independent coding peer for the OpenAI Codex agent.
 
 You are running automatically from a Codex UserPromptSubmit hook, in READ-ONLY mode.
 Do not edit files. Do not run destructive or mutating commands.
@@ -152,10 +174,10 @@ if [ "$TOOLSMODE" = "none" ]; then
   CLAUDE_TOOL_ARGS=(--tools "")
 else
   ALLOW="Read Grep Glob Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(git show:*) Bash(ls:*) Bash(cat:*)"
-  [ "$DEPTH" = "workflow" ] && ALLOW="$ALLOW Task Workflow ToolSearch"
+  [ "$DEPTH" = "workflow" ] && [ "$CUSTOM_CLAUDE_CONTEXT" -eq 1 ] && ALLOW="$ALLOW Task Workflow ToolSearch"
   CLAUDE_TOOL_ARGS=(--allowedTools "$ALLOW")
 fi
-CLAUDE_ARGS=(-p --permission-mode plan --no-session-persistence --output-format text)
+CLAUDE_ARGS=(-p "${CLAUDE_SAFE_ARGS[@]}" --permission-mode plan --no-session-persistence --output-format text)
 [ -n "$CLAUDE_MODEL" ] && CLAUDE_ARGS+=(--model "$CLAUDE_MODEL")
 [ -n "$CLAUDE_EFFORT" ] && CLAUDE_ARGS+=(--effort "$CLAUDE_EFFORT")
 CLAUDE_ARGS+=("${CLAUDE_TOOL_ARGS[@]}")
@@ -170,7 +192,7 @@ ANALYSIS="$(run_claude)"; RC=$?
 # tool sandbox so a failed first attempt can never widen Claude's tool access.
 if { [ "$RC" -ne 0 ] || [ -z "$ANALYSIS" ]; } && [ "$RC" -ne 124 ]; then
   dbg "claude rc=$RC / empty; retrying with default model+effort (sandbox preserved)"
-  CLAUDE_ARGS=(-p --permission-mode plan --no-session-persistence --output-format text "${CLAUDE_TOOL_ARGS[@]}")
+  CLAUDE_ARGS=(-p "${CLAUDE_SAFE_ARGS[@]}" --permission-mode plan --no-session-persistence --output-format text "${CLAUDE_TOOL_ARGS[@]}")
   ANALYSIS="$(run_claude)"; RC=$?
 fi
 [ "$RC" -eq 0 ] || { dbg "claude rc=$RC -> skip"; exit 0; }

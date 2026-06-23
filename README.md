@@ -103,17 +103,20 @@ absolute paths, so this caveat only applies to a manual merge.)
 | `[no-claude]` in your prompt | - | Skips Claude entirely for that prompt. |
 | `CLAUDE_FUSION_MODEL` | `opus` | Claude model. Defaults to the strongest (latest Opus). |
 | `CLAUDE_FUSION_EFFORT` | `xhigh` | Reasoning effort (`low` / `medium` / `high` / `xhigh` / `max`). |
-| `CLAUDE_FUSION_DEPTH` | `workflow` | `workflow` = let Claude run a read-only multi-agent analysis (ultracode / dynamic workflows); `single` = one-shot analysis (faster). |
+| `CLAUDE_FUSION_DEPTH` | `workflow` | `workflow` = ask Claude for a deeper read-only analysis; `single` = one-shot analysis (faster). With the default safe mode, workflow stays isolated. |
 | `CLAUDE_FUSION_TOOLS` | `readonly` | `readonly` = Claude can read/grep/glob + read-only git to explore the repo; `none` = `--tools ""` (analyze only the injected prompt + git status/diff). |
+| `CLAUDE_FUSION_SAFE_MODE` | `1` | `1` = run Claude with `--safe-mode`, preventing `CLAUDE.md`, memory, skills, plugins, workflows, MCP servers, and custom agents from leaking into the consult. If your Claude Code build does not support `--safe-mode`, the hook skips rather than falling back to custom context. `0` = allow local Claude customizations, including ultracode/dynamic workflows. |
 | `CLAUDE_FUSION_TIMEOUT` | `600` (workflow) / `300` (single) | Internal timeout (seconds) around the `claude` call. |
 | `CLAUDE_FUSION_DEBUG=1` | off | Logs gate/flow to `${TMPDIR:-/tmp}/claude-fusion-state-<uid>/debug.log`. |
 
-> **Strongest model, deep analysis, by default.** Claude Fusion runs on the best Claude model at
-> `xhigh` and, by default, lets it orchestrate a read-only multi-agent analysis, so the second
-> opinion is as strong as possible. **This costs latency:** a complex prompt waits for Claude
-> (often 1-3 minutes, sometimes longer in `workflow` mode) before Codex responds. To trade quality
-> for speed, set `CLAUDE_FUSION_DEPTH=single`, lower `CLAUDE_FUSION_EFFORT`, or use `[no-claude]` to
-> skip a given prompt. The hook-registration timeout in `hooks.json` (660s) sits above the internal
+> **Strongest model, isolated by default.** Claude Fusion runs on the best Claude model at `xhigh`
+> and, by default, uses Claude Code `--safe-mode` so the consult stays focused on the injected task
+> and repository context rather than your personal Claude setup. **This costs latency:** a complex
+> prompt waits for Claude (often 1-3 minutes, sometimes longer in `workflow` mode) before Codex
+> responds. To deliberately trade isolation for local Claude workflows, set
+> `CLAUDE_FUSION_SAFE_MODE=0`. To trade quality for speed, set `CLAUDE_FUSION_DEPTH=single`, lower
+> `CLAUDE_FUSION_EFFORT`, or use `[no-claude]` to skip a given prompt. The hook-registration timeout
+> in `hooks.json` (660s) sits above the internal
 > timeout; if your Codex build caps hook timeouts lower and `workflow` analyses get killed, use
 > `single` mode or a smaller `CLAUDE_FUSION_TIMEOUT`.
 
@@ -126,8 +129,10 @@ verb. To make it conservative instead, edit the gate block in `hooks/claude-fusi
 
 ## Safety model
 
-- Claude always runs `--permission-mode plan` (it cannot edit files) and, by default, only read-only
-  tools. The prompt also tells Claude not to inspect credentials, `.env`, tokens, keychains, shell
+- Claude always runs `--permission-mode plan` (it cannot edit files), `--no-session-persistence`,
+  and, by default, `--safe-mode` plus read-only tools. Safe mode prevents Claude Code from loading
+  `CLAUDE.md`, memory, skills, plugins, workflows, MCP servers, and custom agents into the automatic
+  consult. The prompt also tells Claude not to inspect credentials, `.env`, tokens, keychains, shell
   history, or auth files.
 - Both hooks **never block** Codex on the no-action path - they always exit 0. If Claude is missing,
   not logged in, times out, or errors, the hook silently skips. A `timeout` wrapper bounds every

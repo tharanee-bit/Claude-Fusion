@@ -104,13 +104,14 @@ else:
         raise
     print(f"hooks.json merged (UserPromptSubmit changed: {changed_ups}, Stop changed: {changed_stop})")
 
-# Coexistence warning: a [hooks] table in config.toml plus hooks.json may double-register.
+# Coexistence warning: configured hooks in config.toml plus hooks.json may double-register.
 cfg = os.environ.get("CF_CONFIG", "")
 if cfg and os.path.exists(cfg):
     try:
         import tomllib
         with open(cfg, "rb") as f:
-            if "hooks" in tomllib.load(f):
+            hooks_cfg = tomllib.load(f).get("hooks")
+            if isinstance(hooks_cfg, dict) and any(event in hooks_cfg for event in EVENTS):
                 print("WARNING: ~/.codex/config.toml already defines a [hooks] table. You may end up "
                       "with duplicate hooks; remove the config.toml [hooks] entries or the hooks.json ones.",
                       file=sys.stderr)
