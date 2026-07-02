@@ -12,7 +12,8 @@ PY="$(command -v python3 || true)"
 if [ -f "$HOOKS_FILE" ]; then
   CF_HOOKS_FILE="$HOOKS_FILE" "$PY" - <<'PY'
 import json, os, shutil, sys, tempfile
-s = os.environ["CF_HOOKS_FILE"]
+# realpath: keep a symlinked hooks.json a symlink (atomic replace must land on the target).
+s = os.path.realpath(os.environ["CF_HOOKS_FILE"])
 try:
     with open(s) as f:
         d = json.load(f)
@@ -65,6 +66,6 @@ else:
 PY
 fi
 
-rm -f "$CODEX_DIR/hooks/claude-fusion-userprompt.sh" "$CODEX_DIR/hooks/claude-fusion-stop.sh"
+rm -f "$CODEX_DIR/hooks/claude-fusion-common.sh" "$CODEX_DIR/hooks/claude-fusion-userprompt.sh" "$CODEX_DIR/hooks/claude-fusion-stop.sh"
 rm -rf "$CODEX_DIR/skills/claude-fusion-auto"
 echo "Removed hook scripts and skill. Restart Codex to apply."

@@ -50,7 +50,11 @@ Codex stays the editor and the final judge. Claude only advises and reviews - it
 
 The two hooks coordinate through a small per-session marker file in
 `${TMPDIR:-/tmp}/claude-fusion-state-<uid>/`, so the Stop review only fires for tasks the UserPromptSubmit
-gate already judged complex.
+gate already judged complex. The marker records the prompt-time `HEAD`, and the Stop hook diffs the
+working tree against that commit, so work Codex commits mid-turn still gets reviewed. Each definitive
+review also stores a hash of the reviewed diff (an unchanged diff is not re-reviewed by a later gated
+prompt), and repeated transient review failures on the same diff stop after
+`CLAUDE_FUSION_STOP_RETRY_LIMIT` attempts.
 
 ## Requirements
 
@@ -107,6 +111,9 @@ absolute paths, so this caveat only applies to a manual merge.)
 | `CLAUDE_FUSION_TOOLS` | `readonly` | `readonly` = Claude can read/grep/glob + read-only git to explore the repo; `none` = `--tools ""` (analyze only the injected prompt + git status/diff). |
 | `CLAUDE_FUSION_SAFE_MODE` | `1` | `1` = run Claude with `--safe-mode`, preventing `CLAUDE.md`, memory, skills, plugins, workflows, MCP servers, and custom agents from leaking into the consult. If your Claude Code build does not support `--safe-mode`, the hook skips rather than falling back to custom context. `0` = allow local Claude customizations, including ultracode/dynamic workflows. |
 | `CLAUDE_FUSION_TIMEOUT` | `600` (workflow) / `300` (single) | Internal timeout (seconds) around the `claude` call. |
+| `CLAUDE_FUSION_STOP_RETRY_LIMIT` | `2` | Transient failed Stop-review attempts for an unchanged diff before skipping until the diff changes. |
+| `CLAUDE_FUSION_EXCLUDE` | - | Extra space-separated globs to exclude from the status/diff sent to Claude, on top of the built-in sensitive-path denylist (globs containing spaces are unsupported). |
+| `CLAUDE_FUSION_MAX_FILE_BYTES` | `409600` | Per-file size cap; changed files larger than this are dropped from the diff payload. |
 | `CLAUDE_FUSION_DEBUG=1` | off | Logs gate/flow to `${TMPDIR:-/tmp}/claude-fusion-state-<uid>/debug.log`. |
 
 > **Strongest model, isolated by default.** Claude Fusion runs on the best Claude model at `xhigh`
@@ -132,8 +139,16 @@ verb. To make it conservative instead, edit the gate block in `hooks/claude-fusi
 - Claude always runs `--permission-mode plan` (it cannot edit files), `--no-session-persistence`,
   and, by default, `--safe-mode` plus read-only tools. Safe mode prevents Claude Code from loading
   `CLAUDE.md`, memory, skills, plugins, workflows, MCP servers, and custom agents into the automatic
-  consult. The prompt also tells Claude not to inspect credentials, `.env`, tokens, keychains, shell
-  history, or auth files.
+  consult. (The `--safe-mode` capability probe is cached per resolved `claude` binary, so it does not
+  re-run `claude --help` on every prompt; updates invalidate the cache automatically.)
+- **Sensitive paths never reach Claude in the harness payload.** The `git status` and diff the hooks
+  embed are filtered at the source against a denylist of secret-bearing paths (env files, keys and
+  certificates, `credentials*`/`secrets*`, shell history, `.netrc`/`.npmrc`/`.pypirc`, `auth.json`,
+  SQLite databases, `.ssh`/`.aws`/`.gnupg` contents - extensible via `CLAUDE_FUSION_EXCLUDE`).
+  Status lines for such paths are redacted; their diffs are dropped entirely, with a visible
+  exclusion note. The prompt additionally tells Claude not to inspect credentials, but the guarantee
+  is the source-level exclusion, not that instruction. Known limit: the filter is path-based, so if
+  a turn renames a secret file to a non-denylisted name, the content appears under its new name.
 - Both hooks **never block** Codex on the no-action path - they always exit 0. If Claude is missing,
   not logged in, times out, or errors, the hook silently skips. A `timeout` wrapper bounds every
   `claude` call so a hook can never hang Codex.
@@ -141,10 +156,10 @@ verb. To make it conservative instead, edit the gate block in `hooks/claude-fusi
   `CLAUDE_REVIEW_VERDICT: ISSUES_FOUND`, and it is loop-safe via `stop_hook_active` - it reviews at
   most once per task.
 - **Loop-safe with Codex Fusion.** If you also run [Codex Fusion](https://github.com/tharanee-bit/Codex-Fusion) (Claude ->
-  Codex), Claude Fusion exports `CLAUDE_FUSION_ACTIVE=1` when it calls Claude and short-circuits at
-  the top of every hook when that variable is set, so the inherited environment breaks any
-  claude<->codex hook loop. (Independently, `codex exec` - which Codex Fusion uses - does not fire
-  Codex lifecycle hooks.)
+  Codex), Claude Fusion exports `CLAUDE_FUSION_ACTIVE=1` and `CODEX_FUSION_ACTIVE=1` when it calls
+  Claude and short-circuits at the top of every hook when either variable is set, so the inherited
+  environment breaks any claude<->codex hook loop. (Independently, `codex exec` - which Codex Fusion
+  uses - does not fire Codex lifecycle hooks.)
 
 ## Test it
 
@@ -177,14 +192,19 @@ the installed hook scripts and skill. Your other hooks and settings are untouche
 ## Layout
 
 ```
+hooks/claude-fusion-common.sh       # shared helpers (state dir, gate plumbing, filtering, claude runner)
 hooks/claude-fusion-userprompt.sh   # Codex UserPromptSubmit hook (pre-edit analysis)
 hooks/claude-fusion-stop.sh         # Codex Stop hook (post-diff review)
 skills/claude-fusion-auto/SKILL.md  # how Codex synthesizes Codex + Claude
 hooks.snippet.json                  # hooks block to merge into ~/.codex/hooks.json (manual install)
 config-hooks.snippet.toml           # alternative: [hooks] tables for ~/.codex/config.toml
 AGENTS.snippet.md                   # optional always-on guidance for ~/.codex/AGENTS.md
+tests/test_hooks.py                 # unittest suite with a fake `claude` shim
 install.sh / uninstall.sh           # idempotent installer / remover
 ```
+
+If you install manually, copy `hooks/claude-fusion-common.sh` alongside the two hook scripts - they
+source it from their own directory and silently skip if it is missing.
 
 ## How the Codex hook contract was verified
 

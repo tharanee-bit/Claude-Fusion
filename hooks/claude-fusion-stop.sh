@@ -1,77 +1,106 @@
 #!/usr/bin/env bash
 # claude-fusion-stop.sh  (Codex Stop hook)
 # When the finished task was gated-complex (marker from the UserPromptSubmit hook) AND there are
-# working-tree changes, run Claude READ-ONLY over `git diff HEAD`. If Claude returns ISSUES_FOUND,
-# block ONCE (decision:block) with the review. For Codex's Stop event, decision:block does not reject
-# the turn -- it makes Codex continue, using `reason` as a new prompt. Loop-safe; never errors out.
+# working-tree changes since the prompt-time HEAD recorded in that marker, run Claude READ-ONLY over
+# the filtered diff. If Claude returns ISSUES_FOUND, block ONCE (decision:block) with the review.
+# For Codex's Stop event, decision:block does not reject the turn -- it makes Codex continue, using
+# `reason` as a new prompt. Loop-safe; never errors out.
 set +e
-export PATH="$HOME/.local/bin:$HOME/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
 
-# Recursion guard (see userprompt hook).
-[ "${CLAUDE_FUSION_ACTIVE:-0}" = "1" ] && exit 0
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=hooks/claude-fusion-common.sh
+. "$SCRIPT_DIR/claude-fusion-common.sh" 2>/dev/null || exit 0
+clf_init_common "STOP"
 
-# Per-user state dir, mode 0700 (see the UserPromptSubmit hook); refuse a dir we do not own.
-STATE_DIR="${TMPDIR:-/tmp}/claude-fusion-state-$(id -u 2>/dev/null || echo 0)"
-ensure_state_dir(){ mkdir -p -m 700 "$STATE_DIR" 2>/dev/null || return 1; [ -O "$STATE_DIR" ] || return 1; }
-dbg(){ [ "${CLAUDE_FUSION_DEBUG:-0}" = "1" ] && ensure_state_dir && printf '%s STOP: %s\n' "$$" "$*" >>"$STATE_DIR/debug.log"; }
+# Recursion guard (see the common helper).
+clf_nested_fusion_active && exit 0
 
-PY="/usr/bin/python3"; [ -x "$PY" ] || PY="$(command -v python3 2>/dev/null)"; [ -x "$PY" ] || exit 0
-CLAUDE_BIN="$(command -v claude 2>/dev/null)"
-if [ ! -x "$CLAUDE_BIN" ]; then
-  for c in "$HOME/.local/bin/claude" "$HOME/bin/claude" "/usr/local/bin/claude" "$HOME/.npm-global/bin/claude"; do
-    [ -x "$c" ] && { CLAUDE_BIN="$c"; break; }
-  done
-fi
-[ -x "$CLAUDE_BIN" ] || exit 0
-_cl_dir="$(dirname "$("$PY" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$CLAUDE_BIN" 2>/dev/null || echo "$CLAUDE_BIN")")"
-case ":$PATH:" in *":$_cl_dir:"*) ;; *) export PATH="$_cl_dir:$PATH";; esac
+clf_setup_claude_runtime || exit 0
 
-MAX_DIFF=20000; MAX_CHARS=12000
-CLAUDE_MODEL="${CLAUDE_FUSION_MODEL:-opus}"
-CLAUDE_EFFORT="${CLAUDE_FUSION_EFFORT:-xhigh}"
-DEPTH="${CLAUDE_FUSION_DEPTH:-workflow}"
-TOOLSMODE="${CLAUDE_FUSION_TOOLS:-readonly}"
-SAFE_MODE="${CLAUDE_FUSION_SAFE_MODE:-1}"
-CLAUDE_SAFE_ARGS=(--safe-mode)
-case "$SAFE_MODE" in
-  0|false|False|FALSE|no|No|NO|off|Off|OFF) CLAUDE_SAFE_ARGS=();;
-esac
-CUSTOM_CLAUDE_CONTEXT=0
-[ "${#CLAUDE_SAFE_ARGS[@]}" -eq 0 ] && CUSTOM_CLAUDE_CONTEXT=1
-claude_supports_safe_mode(){ timeout 10 "$CLAUDE_BIN" --help 2>&1 | grep -q -- '--safe-mode'; }
-if [ "$DEPTH" = "workflow" ]; then DEF_TIMEOUT=600; else DEF_TIMEOUT=300; fi
-CLAUDE_TIMEOUT="${CLAUDE_FUSION_TIMEOUT:-$DEF_TIMEOUT}"
+MAX_DIFF=20000
+MAX_CHARS=12000
 
-INPUT="$(cat)"; [ -n "$INPUT" ] || exit 0
-FIELDS="$(printf '%s' "$INPUT" | "$PY" -c '
-import sys,json,base64
-try: d=json.load(sys.stdin)
-except Exception: d={}
-for k in ("cwd","session_id","stop_hook_active"):
-    v=d.get(k,"")
-    if isinstance(v,bool): v="true" if v else "false"
-    sys.stdout.write(base64.b64encode(str(v or "").encode()).decode()+"\n")
-' 2>/dev/null)"
-CWD="$(printf '%s' "$FIELDS" | sed -n 1p | base64 -d 2>/dev/null)"
-SESSION_ID="$(printf '%s' "$FIELDS" | sed -n 2p | base64 -d 2>/dev/null)"
-STOP_ACTIVE="$(printf '%s' "$FIELDS" | sed -n 3p | base64 -d 2>/dev/null)"
-case "$SESSION_ID" in *[!A-Za-z0-9._-]*|.|..) SESSION_ID="";; esac
+INPUT="$(cat)"
+[ -n "$INPUT" ] || exit 0
+FIELDS="$(clf_parse_fields "$INPUT" cwd session_id stop_hook_active)"
+CWD="$(clf_field "$FIELDS" 1)"
+SESSION_ID="$(clf_sanitize_session_id "$(clf_field "$FIELDS" 2)")"
+STOP_ACTIVE="$(clf_field "$FIELDS" 3)"
 
 # loop guard: we're already inside a continuation we forced -> don't review again
-[ "$STOP_ACTIVE" = "true" ] && { dbg "stop_hook_active -> exit"; exit 0; }
+[ "$STOP_ACTIVE" = "true" ] && { clf_dbg "stop_hook_active -> exit"; exit 0; }
 [ -d "$CWD" ] || CWD="$PWD"
 
 MARKER="$STATE_DIR/$SESSION_ID.complex"
-[ -n "$SESSION_ID" ] && [ -f "$MARKER" ] || { dbg "no complex marker -> exit"; exit 0; }
+[ -n "$SESSION_ID" ] && [ -f "$MARKER" ] || { clf_dbg "no complex marker -> exit"; exit 0; }
+REVIEWED_FILE="$STATE_DIR/$SESSION_ID.reviewed"
+FAILED_FILE="$STATE_DIR/$SESSION_ID.failed-review"
 
-DIFF="$(git -C "$CWD" diff HEAD 2>/dev/null | head -c "$MAX_DIFF")"
-[ -n "$DIFF" ] || { dbg "empty diff -> exit"; rm -f "$MARKER" 2>/dev/null; exit 0; }
-CHANGED="$(git -C "$CWD" status --short 2>/dev/null | head -c 3000)"
-# NOTE: the marker is deleted only on a DEFINITIVE outcome (PASS, or a delivered ISSUES_FOUND block),
-# not here. A transient failure leaves it so the next genuine Stop retries the review.
+# Diff against the prompt-time HEAD recorded in the marker, not the current one, so commits made
+# during the turn stay in the review surface. Empty/unresolvable marker content (pre-upgrade format,
+# non-git cwd at prompt time, rebase, gc) falls back to HEAD: fail-open toward reviewing.
+BASE="$(cat "$MARKER" 2>/dev/null)"
+case "$BASE" in *[!0-9a-f]*) BASE="";; esac
+if [ -z "$BASE" ] || ! git -C "$CWD" rev-parse --verify --quiet "$BASE^{commit}" >/dev/null 2>&1; then
+  [ -n "$BASE" ] && clf_dbg "stored base sha unresolvable -> falling back to HEAD"
+  BASE="HEAD"
+fi
 
-if [ "${#CLAUDE_SAFE_ARGS[@]}" -gt 0 ] && ! claude_supports_safe_mode; then
-  dbg "claude lacks --safe-mode -> exit (marker kept; update Claude Code or set CLAUDE_FUSION_SAFE_MODE=0)"
+DIFF_FULL="$(clf_filtered_diff "$CWD" "$BASE" 2>/dev/null)"
+[ -n "$DIFF_FULL" ] || { clf_dbg "empty diff -> exit"; rm -f "$MARKER" 2>/dev/null; exit 0; }
+DIFF="$(clf_truncate_bytes "$DIFF_FULL" "$MAX_DIFF" "diff")"
+CHANGED="$(clf_truncate_bytes "$(clf_filtered_status "$CWD")" 3000 "changed files")"
+# NOTE: the marker is deleted only on a DEFINITIVE outcome (PASS, a delivered ISSUES_FOUND block, or
+# an unchanged already-reviewed diff), not here. A transient failure leaves it for the next Stop.
+
+# Hash the FULL filtered diff, not the truncated payload: otherwise any change past the truncation
+# point hashes identically and a genuinely new diff would be skipped as already reviewed.
+DIFF_HASH="$(printf '%s' "$DIFF_FULL" | git hash-object --stdin 2>/dev/null)"
+LAST_REVIEWED="$(cat "$REVIEWED_FILE" 2>/dev/null)"
+if [ -n "$DIFF_HASH" ] && [ "$LAST_REVIEWED" = "$DIFF_HASH" ]; then
+  clf_dbg "diff already reviewed -> exit"
+  rm -f "$MARKER" 2>/dev/null
+  exit 0
+fi
+
+retry_limit() {
+  clf_positive_int "${CLAUDE_FUSION_STOP_RETRY_LIMIT:-2}" 2
+}
+
+retry_exhausted() {
+  [ -f "$FAILED_FILE" ] || return 1
+  read -r _hash _count <"$FAILED_FILE" 2>/dev/null
+  [ "$_hash" = "$DIFF_HASH" ] || return 1
+  [ "${_count:-0}" -ge "$(retry_limit)" ]
+}
+
+record_review_failure() {
+  clf_ensure_state_dir || return 0
+  _old_hash=""
+  _old_count=0
+  [ -f "$FAILED_FILE" ] && read -r _old_hash _old_count <"$FAILED_FILE" 2>/dev/null
+  if [ "$_old_hash" = "$DIFF_HASH" ]; then
+    _new_count=$(( ${_old_count:-0} + 1 ))
+  else
+    _new_count=1
+  fi
+  printf '%s %s\n' "$DIFF_HASH" "$_new_count" >"$FAILED_FILE" 2>/dev/null
+  clf_dbg "recorded review failure count=$_new_count hash=$DIFF_HASH"
+}
+
+clear_review_failure() {
+  rm -f "$FAILED_FILE" 2>/dev/null
+}
+
+store_reviewed() {
+  [ -n "$DIFF_HASH" ] || return 0
+  clf_ensure_state_dir && printf '%s\n' "$DIFF_HASH" >"$REVIEWED_FILE" 2>/dev/null
+}
+
+retry_exhausted && { clf_dbg "review retry cap reached for unchanged diff"; exit 0; }
+
+if [ "${#CLAUDE_SAFE_ARGS[@]}" -gt 0 ] && ! clf_safe_mode_supported; then
+  clf_dbg "claude lacks --safe-mode -> exit (marker kept; update Claude Code or set CLAUDE_FUSION_SAFE_MODE=0)"
   exit 0
 fi
 
@@ -115,56 +144,59 @@ $CHANGED
 Diff:
 $DIFF"
 
-# Tool sandbox, built once and applied on EVERY attempt (including the retry) so a failed first try
-# can never silently widen Claude's tool access beyond what CLAUDE_FUSION_TOOLS asked for.
-if [ "$TOOLSMODE" = "none" ]; then
-  CLAUDE_TOOL_ARGS=(--tools "")
-else
-  ALLOW="Read Grep Glob Bash(git status:*) Bash(git diff:*) Bash(git log:*) Bash(git show:*) Bash(ls:*) Bash(cat:*)"
-  [ "$DEPTH" = "workflow" ] && [ "$CUSTOM_CLAUDE_CONTEXT" -eq 1 ] && ALLOW="$ALLOW Task Workflow ToolSearch"
-  CLAUDE_TOOL_ARGS=(--allowedTools "$ALLOW")
-fi
-CLAUDE_ARGS=(-p "${CLAUDE_SAFE_ARGS[@]}" --permission-mode plan --no-session-persistence --output-format text)
-[ -n "$CLAUDE_MODEL" ] && CLAUDE_ARGS+=(--model "$CLAUDE_MODEL")
-[ -n "$CLAUDE_EFFORT" ] && CLAUDE_ARGS+=(--effort "$CLAUDE_EFFORT")
-CLAUDE_ARGS+=("${CLAUDE_TOOL_ARGS[@]}")
-
-run_claude() {
-  printf '%s' "$CLAUDE_PROMPT" | CLAUDE_FUSION_ACTIVE=1 timeout "$CLAUDE_TIMEOUT" \
-    "$CLAUDE_BIN" "${CLAUDE_ARGS[@]}" 2>/dev/null
-}
-dbg "running claude review (model=$CLAUDE_MODEL, effort=$CLAUDE_EFFORT, depth=$DEPTH)"
-REVIEW="$(run_claude)"; RC=$?
-if { [ "$RC" -ne 0 ] || [ -z "$REVIEW" ]; } && [ "$RC" -ne 124 ]; then
-  dbg "claude rc=$RC / empty; retrying with default model+effort (sandbox preserved)"
-  CLAUDE_ARGS=(-p "${CLAUDE_SAFE_ARGS[@]}" --permission-mode plan --no-session-persistence --output-format text "${CLAUDE_TOOL_ARGS[@]}")
-  REVIEW="$(run_claude)"; RC=$?
-fi
-# On a transient failure, KEEP the marker so the next genuine Stop retries the review.
-[ "$RC" -eq 0 ] || { dbg "claude rc!=0 -> exit (marker kept for retry)"; exit 0; }
-[ -n "$REVIEW" ] || { dbg "empty review -> exit (marker kept)"; exit 0; }
-
-# Claude responded: this is a definitive review, so consume the marker (review once).
-rm -f "$MARKER" 2>/dev/null
+clf_build_claude_args
+clf_dbg "running claude review (model=$CLAUDE_MODEL, effort=$CLAUDE_EFFORT, depth=$DEPTH)"
+clf_run_claude_with_retry
+REVIEW="$CLF_OUTPUT"
+RC="$CLF_RC"
+# On a transient failure, KEEP the marker so the next genuine Stop retries the review; the bounded
+# failure counter stops an unchanged diff from retrying forever.
+[ "$RC" -eq 0 ] || { record_review_failure; clf_dbg "claude rc!=0 -> exit (marker kept for retry)"; exit 0; }
+[ -n "$REVIEW" ] || { record_review_failure; clf_dbg "empty review -> exit (marker kept)"; exit 0; }
 
 # Only block when Claude explicitly flags issues. The verdict is the FIRST non-empty line, so check
 # only that -- this also stops injected diff/prompt content from forging the control token.
-VERDICT_LINE="$(printf '%s' "$REVIEW" | grep -m1 -vE '^[[:space:]]*$')"
+VERDICT_LINE="$(clf_first_nonempty_line "$REVIEW")"
 if ! printf '%s' "$VERDICT_LINE" | grep -qiE 'CLAUDE_REVIEW_VERDICT:[[:space:]]*ISSUES_FOUND'; then
-  dbg "verdict PASS/none -> exit"; exit 0
+  # Definitive PASS: consume the marker (review once) and remember the reviewed payload hash so an
+  # unchanged diff is not re-reviewed by a later gated prompt.
+  rm -f "$MARKER" 2>/dev/null
+  store_reviewed
+  clear_review_failure
+  clf_dbg "verdict PASS/none -> exit"
+  exit 0
 fi
 
-REVIEW="$REVIEW" MAX_CHARS="$MAX_CHARS" "$PY" <<'PY'
+emit_block() {
+  # Shell-side cap BEFORE the env handoff: a single env string over ~128KiB fails execve (E2BIG),
+  # the python truncation would never run, and a review that found issues would be silently lost.
+  REVIEW="$(clf_truncate_bytes "$1" 100000 "claude review")" MAX_CHARS="$MAX_CHARS" "$PY" <<'PY'
 import os, json
 r = os.environ.get("REVIEW", "")
 try: m = int(os.environ.get("MAX_CHARS", "12000"))
 except Exception: m = 12000
-if len(r) > m: r = r[:m] + "\n\n[...truncated...]"
+if len(r) > m:
+    r = r[:m]
+    cut = r.rfind("\n")
+    if cut > 0:
+        r = r[:cut]
+    r += "\n\n[...review truncated at " + str(m) + " chars...]"
 reason = ("AUTOMATIC CLAUDE FUSION - POST-DIFF REVIEW:\n"
           "Claude independently reviewed your git diff and flagged potential issues. Address the "
           "serious problems (correctness, security, data-loss, concurrency, broken tests) before "
           "finalizing, or explicitly justify why each is not a real issue. You remain the final judge.\n\n" + r)
 print(json.dumps({"decision": "block", "reason": reason}))
 PY
-dbg "blocked with ISSUES_FOUND"
+}
+
+# Consume the marker and store the reviewed hash only AFTER the block is actually delivered; a
+# failed emission keeps the marker (and records a bounded failure) so the finding is not lost.
+BLOCK_JSON="$(emit_block "$REVIEW")"
+EMIT_RC=$?
+[ "$EMIT_RC" -eq 0 ] && [ -n "$BLOCK_JSON" ] || { record_review_failure; clf_dbg "block json emit failed (marker kept)"; exit 0; }
+printf '%s\n' "$BLOCK_JSON" || { record_review_failure; clf_dbg "block json delivery failed (marker kept)"; exit 0; }
+rm -f "$MARKER" 2>/dev/null
+store_reviewed
+clear_review_failure
+clf_dbg "blocked with ISSUES_FOUND"
 exit 0

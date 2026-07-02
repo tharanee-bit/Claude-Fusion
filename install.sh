@@ -21,6 +21,7 @@ if ! command -v claude >/dev/null 2>&1; then
 fi
 
 mkdir -p "$HOOKS_DIR" "$SKILLS_DIR/claude-fusion-auto"
+install -m 0644 "$HERE/hooks/claude-fusion-common.sh"      "$HOOKS_DIR/claude-fusion-common.sh"
 install -m 0755 "$HERE/hooks/claude-fusion-userprompt.sh" "$HOOKS_DIR/claude-fusion-userprompt.sh"
 install -m 0755 "$HERE/hooks/claude-fusion-stop.sh"        "$HOOKS_DIR/claude-fusion-stop.sh"
 install -m 0644 "$HERE/skills/claude-fusion-auto/SKILL.md" "$SKILLS_DIR/claude-fusion-auto/SKILL.md"
@@ -33,7 +34,9 @@ CF_CONFIG="$CONFIG_FILE" \
 CF_TIMEOUT="$HOOK_TIMEOUT" "$PY" - <<'PY'
 import json, os, sys, shutil, tempfile
 
-hooks_file = os.environ["CF_HOOKS_FILE"]
+# realpath: users symlink hooks.json into dotfile repos; os.replace on the symlink path would swap
+# the link itself for a regular file. Resolve first so the atomic write lands on the target.
+hooks_file = os.path.realpath(os.environ["CF_HOOKS_FILE"])
 ups, stop = os.environ["CF_UPS"], os.environ["CF_STOP"]
 HOOK_TIMEOUT = int(os.environ["CF_TIMEOUT"])
 
