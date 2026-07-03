@@ -180,6 +180,18 @@ echo '{"prompt":"Refactor the auth module to fix a race condition","cwd":"'"$PWD
 (That prints the `{"hookSpecificOutput":{...}}` JSON Codex consumes. Use `CLAUDE_FUSION_DEPTH=single`
 for a faster check.)
 
+## Health check
+
+The companion [Codex Fusion](../Codex%20Fusion) repo ships `bin/harness-doctor`, a read-only
+health check that covers this direction too (registration, install parity, timeouts, exec bits,
+`--safe-mode` support, hook-trust entries in `config.toml`). If both repos sit side by side it
+finds this one automatically; otherwise point it here with `CLAUDE_FUSION_REPO=/path/to/repo`.
+
+Note on `AGENTS.snippet.md`: merging it into `~/.codex/AGENTS.md` is deliberately optional and
+skipped by the installer. The hook injects a self-contained preamble with every consult, so the
+always-on snippet would cost tokens on every Codex turn — including turns with no Fusion context —
+for no added signal. Opt in later with `cat AGENTS.snippet.md >> ~/.codex/AGENTS.md` if you want it.
+
 ## Uninstall
 
 ```bash

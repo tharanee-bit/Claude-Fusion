@@ -505,6 +505,48 @@ class HookTestCase(unittest.TestCase):
         self.assertFalse(self.marker("hugereview").exists())
         self.assertTrue(self.state_file("hugereview", "reviewed").exists())
 
+    def test_nongit_cwd_warns_once_per_session(self):
+        plain = self.base / "plain"
+        plain.mkdir()
+        res = self.run_hook(
+            USERPROMPT_HOOK, {"prompt": GATED_PROMPT, "cwd": str(plain), "session_id": "nogit"}
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        context = json.loads(res.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("not a git repository", context)
+        self.assertIn("analysis from fake claude", context, "the warning must not displace the consult")
+        self.assertTrue(self.state_file("nogit", "nogit-warned").exists())
+
+        self.clear_log()
+        res = self.run_hook(
+            USERPROMPT_HOOK, {"prompt": GATED_PROMPT, "cwd": str(plain), "session_id": "nogit"}
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        context = json.loads(res.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("not a git repository", context, "the warning must fire once per session")
+
+    def test_nongit_cwd_warns_on_skip_paths(self):
+        plain = self.base / "plain"
+        plain.mkdir()
+        res = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": GATED_PROMPT + " [no-claude]", "cwd": str(plain), "session_id": "nogitskip"},
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        context = json.loads(res.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("not a git repository", context)
+        self.assertNotIn("BEGIN CLAUDE ANALYSIS", context)
+        self.assertEqual(self.consults(), [], "[no-claude] must still skip the consult")
+        self.assertTrue(self.state_file("nogitskip", "nogit-warned").exists())
+
+        # In a git repo the skip paths must stay completely silent (no warning-only payload).
+        res = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": GATED_PROMPT + " [no-claude]", "cwd": str(self.repo), "session_id": "gitskip"},
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+
     def test_installer_idempotent_and_home_norm(self):
         codex_dir = self.home / ".codex"
         codex_dir.mkdir(parents=True)
