@@ -1,0 +1,35 @@
+{
+  "name": "claude-fusion",
+  "version": "0.1.0",
+  "description": "Automatically consults Claude Code through synchronous, read-only Codex hooks for planning and review.",
+  "author": {
+    "name": "tharanee-bit",
+    "url": "https://github.com/tharanee-bit"
+  },
+  "homepage": "https://github.com/tharanee-bit/Claude-Fusion",
+  "repository": "https://github.com/tharanee-bit/Claude-Fusion",
+  "license": "MIT",
+  "keywords": [
+    "claude",
+    "codex",
+    "hooks",
+    "code-review",
+    "read-only"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Claude Fusion",
+    "shortDescription": "Automatic read-only Claude planning and review",
+    "longDescription": "Keeps Codex primary while synchronously consulting Claude Code for structured pre-task analysis, bounded subagent review, and final diff review. Claude receives read-only tools and filtered repository context.",
+    "developerName": "tharanee-bit",
+    "category": "Productivity",
+    "capabilities": [
+      "Automatic hooks",
+      "Read-only analysis"
+    ],
+    "defaultPrompt": [
+      "Implement this complex coding task with automatic Claude Fusion review."
+    ],
+    "websiteURL": "https://github.com/tharanee-bit/Claude-Fusion"
+  }
+}

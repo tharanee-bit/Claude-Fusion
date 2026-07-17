@@ -1,6 +1,7 @@
 # Manual fallback: append these tables to ~/.codex/config.toml instead of using ~/.codex/hooks.json.
 # (The installer writes ~/.codex/hooks.json, which is non-destructive. Use this only if you prefer
-# to keep hooks inside config.toml. Both load paths are equivalent; do not define the same hook twice.)
+# to keep hooks inside config.toml. Do not enable this legacy registration while the plugin is
+# installed, and do not define the same hook through both config.toml and hooks.json.)
 #
 # Replace $HOME with your absolute home path if Codex does not expand it.
 
@@ -9,9 +10,18 @@
 type = "command"
 command = "$HOME/.codex/hooks/claude-fusion-userprompt.sh"
 timeout = 660
+statusMessage = "Claude Fusion is analyzing the task read-only"
+
+[[hooks.SubagentStop]]
+[[hooks.SubagentStop.hooks]]
+type = "command"
+command = "$HOME/.codex/hooks/claude-fusion-subagent-stop.sh"
+timeout = 660
+statusMessage = "Claude Fusion is reviewing the subagent result read-only"
 
 [[hooks.Stop]]
 [[hooks.Stop.hooks]]
 type = "command"
 command = "$HOME/.codex/hooks/claude-fusion-stop.sh"
 timeout = 660
+statusMessage = "Claude Fusion is reviewing the final diff read-only"

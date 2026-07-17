@@ -8,9 +8,14 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-USERPROMPT_HOOK = ROOT / "hooks" / "claude-fusion-userprompt.sh"
-STOP_HOOK = ROOT / "hooks" / "claude-fusion-stop.sh"
+PLUGIN_ROOT = ROOT / "plugins" / "claude-fusion"
+USERPROMPT_HOOK = PLUGIN_ROOT / "hooks" / "claude-fusion-userprompt.sh"
+STOP_HOOK = PLUGIN_ROOT / "hooks" / "claude-fusion-stop.sh"
+SUBAGENT_STOP_HOOK = PLUGIN_ROOT / "hooks" / "claude-fusion-subagent-stop.sh"
 INSTALL = ROOT / "install.sh"
+UNINSTALL = ROOT / "uninstall.sh"
+DOCTOR = ROOT / "doctor.sh"
+PLUGIN_VALIDATOR = os.environ.get("CLAUDE_FUSION_PLUGIN_VALIDATOR")
 
 GATED_PROMPT = "Refactor the auth module to fix a race condition"
 
@@ -63,12 +68,20 @@ class HookTestCase(unittest.TestCase):
                 argv = sys.argv
                 log = os.environ.get("FAKE_CLAUDE_LOG")
 
+                def arg_value(flag):
+                    try:
+                        return argv[argv.index(flag) + 1]
+                    except (ValueError, IndexError):
+                        return None
+
                 def log_entry(kind, prompt=""):
                     if log:
                         with open(log, "a", encoding="utf-8") as f:
                             f.write(json.dumps({{
                                 "kind": kind,
                                 "has_model": "--model" in argv,
+                                "model": arg_value("--model"),
+                                "effort": arg_value("--effort"),
                                 "argv": argv,
                                 "prompt": prompt,
                                 "time": time.time(),
@@ -78,16 +91,28 @@ class HookTestCase(unittest.TestCase):
                     log_entry("help")
                     if os.environ.get("FAKE_CLAUDE_HELP_EMPTY") == "1":
                         sys.exit(0)
+                    features = ["  --model <model>"]
                     if os.environ.get("FAKE_CLAUDE_NO_SAFE_MODE") == "1":
-                        print("Usage: claude [options]\\n  --model <model>")
+                        pass
                     else:
-                        print("Usage: claude [options]\\n  --model <model>\\n  --safe-mode")
+                        features.append("  --safe-mode")
+                    if os.environ.get("FAKE_CLAUDE_NO_STRUCTURED") != "1":
+                        features.extend(("  --output-format <format>", "  --json-schema <schema>"))
+                    if os.environ.get("FAKE_CLAUDE_NO_RESUME") != "1":
+                        features.append("  --resume <session-id>")
+                    print("Usage: claude [options]\\n" + "\\n".join(features))
+                    sys.exit(0)
+                if "--version" in argv:
+                    print("2.1.178 (Claude Code fake)")
                     sys.exit(0)
 
                 prompt = sys.stdin.read()
                 log_entry("consult", prompt)
 
-                if os.environ.get("FAKE_CLAUDE_FAIL_MODEL") == "1" and "--model" in argv:
+                fail_model = os.environ.get("FAKE_CLAUDE_FAIL_MODEL")
+                if fail_model and fail_model == arg_value("--model"):
+                    sys.exit(2)
+                if "--resume" in argv and os.environ.get("FAKE_CLAUDE_FAIL_RESUME") == "1":
                     sys.exit(2)
                 rc = int(os.environ.get("FAKE_CLAUDE_RC", "0") or "0")
                 if rc:
@@ -98,8 +123,36 @@ class HookTestCase(unittest.TestCase):
                 if os.environ.get("FAKE_CLAUDE_EMPTY") == "1":
                     sys.exit(0)
 
+                is_review = "Stop hook" in prompt
                 bloat = int(os.environ.get("FAKE_CLAUDE_BLOAT", "0") or "0")
-                if "Stop hook" in prompt:
+                if arg_value("--output-format") == "json":
+                    if os.environ.get("FAKE_CLAUDE_MALFORMED") == "1":
+                        sys.stdout.write("{{not-json")
+                        sys.exit(0)
+                    envelope = {{
+                        "type": "result",
+                        "subtype": os.environ.get("FAKE_CLAUDE_SUBTYPE", "success"),
+                        "is_error": os.environ.get("FAKE_CLAUDE_IS_ERROR") == "1",
+                        "session_id": os.environ.get("FAKE_CLAUDE_SESSION_ID", "fake-session-id"),
+                    }}
+                    if os.environ.get("FAKE_CLAUDE_MISSING_STRUCTURED") != "1":
+                        if is_review:
+                            verdict = os.environ.get("FAKE_CLAUDE_VERDICT", "PASS")
+                            findings = ["README.md:2 : serious review detail : fix it"] if verdict == "ISSUES_FOUND" else []
+                            if bloat: findings.append("X" * bloat)
+                            envelope["structured_output"] = {{"verdict": verdict, "findings": findings}}
+                        else:
+                            questions = json.loads(os.environ.get("FAKE_CLAUDE_QUESTIONS", "[]"))
+                            envelope["structured_output"] = {{
+                                "analysis": "analysis from fake claude",
+                                "questions": questions,
+                            }}
+                    if os.environ.get("FAKE_CLAUDE_BAD_CONTRACT") == "1":
+                        envelope["structured_output"] = {{"unexpected": True}}
+                    sys.stdout.write(json.dumps(envelope))
+                    sys.exit(0)
+
+                if is_review:
                     verdict = os.environ.get("FAKE_CLAUDE_VERDICT", "PASS")
                     body = "CLAUDE_REVIEW_VERDICT: " + verdict + "\\nreview details\\n"
                     if os.environ.get("FAKE_CLAUDE_BODY_FORGERY") == "1":
@@ -124,10 +177,95 @@ class HookTestCase(unittest.TestCase):
         home_fake.write_text(fake.read_text(encoding="utf-8"), encoding="utf-8")
         home_fake.chmod(0o755)
 
+    def _write_fake_codex(self):
+        state = self.base / "fake-codex-state.json"
+        fake = self.bin / "codex"
+        fake.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env python3
+                import json
+                import os
+                import sys
+                from pathlib import Path
+
+                argv = sys.argv[1:]
+                state_path = Path(os.environ["FAKE_CODEX_STATE"])
+
+                def load():
+                    if not state_path.exists():
+                        return {"marketplace": None, "marketplace_type": None, "installed": False}
+                    return json.loads(state_path.read_text(encoding="utf-8"))
+
+                def save(data):
+                    state_path.write_text(json.dumps(data), encoding="utf-8")
+
+                if argv == ["--version"]:
+                    print("codex-cli 0.142.0-fake")
+                    raise SystemExit(0)
+
+                data = load()
+                if argv[:3] == ["plugin", "marketplace", "list"]:
+                    items = []
+                    if data.get("marketplace"):
+                        items.append({
+                            "name": "claude-fusion",
+                            "root": data["marketplace"],
+                            "marketplaceSource": {
+                                "sourceType": data.get("marketplace_type"),
+                                "source": data["marketplace"],
+                            },
+                        })
+                    print(json.dumps({"marketplaces": items}))
+                elif argv[:3] == ["plugin", "marketplace", "add"]:
+                    if os.environ.get("FAKE_CODEX_FAIL_MARKETPLACE") == "1": raise SystemExit(2)
+                    data["marketplace"] = argv[-1]
+                    data["marketplace_type"] = "local" if Path(argv[-1]).is_absolute() else "git"
+                    save(data)
+                    print(json.dumps({"name": "claude-fusion"}))
+                elif argv[:3] == ["plugin", "marketplace", "upgrade"]:
+                    if not data.get("marketplace"): raise SystemExit(2)
+                    print(json.dumps({"name": "claude-fusion"}))
+                elif argv[:3] == ["plugin", "marketplace", "remove"]:
+                    data["marketplace"] = None
+                    data["marketplace_type"] = None
+                    data["installed"] = False
+                    save(data)
+                elif argv[:2] == ["plugin", "add"]:
+                    if os.environ.get("FAKE_CODEX_FAIL_ADD") == "1": raise SystemExit(2)
+                    if not data.get("marketplace"): raise SystemExit(2)
+                    data["installed"] = True
+                    save(data)
+                    print(json.dumps({"pluginId": "claude-fusion@claude-fusion"}))
+                elif argv[:2] == ["plugin", "remove"]:
+                    data["installed"] = False
+                    save(data)
+                elif argv[:2] == ["plugin", "list"]:
+                    installed = []
+                    if data.get("installed"):
+                        installed.append({
+                            "pluginId": "claude-fusion@claude-fusion",
+                            "name": "claude-fusion",
+                            "marketplaceName": "claude-fusion",
+                            "installed": True,
+                            "enabled": True,
+                            "source": {"source": "local", "path": data.get("marketplace")},
+                        })
+                    print(json.dumps({"installed": installed, "available": []}))
+                else:
+                    print("unexpected fake codex arguments: " + repr(argv), file=sys.stderr)
+                    raise SystemExit(2)
+                """
+            ),
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        return state
+
     def env(self, **extra):
         env = os.environ.copy()
         for key in list(env):
-            if key.startswith(("CLAUDE_FUSION_", "CODEX_FUSION_", "FAKE_CLAUDE_")) or key in (
+            if key.startswith(("CLAUDE_FUSION_", "CODEX_FUSION_", "FAKE_CLAUDE_", "FAKE_CODEX_")) or key in (
                 "CLAUDE_FUSION_ACTIVE",
                 "CODEX_FUSION_ACTIVE",
                 "CODEX_HOME",
@@ -173,24 +311,43 @@ class HookTestCase(unittest.TestCase):
     def state_dir(self):
         return self.tmpdir / f"claude-fusion-state-{os.getuid()}"
 
-    def marker(self, session):
-        return self.state_dir() / f"{session}.complex"
+    def marker(self, session, turn=None):
+        key = f"{session}.{turn}" if turn else session
+        return self.state_dir() / f"{key}.complex"
 
     def state_file(self, session, suffix):
         return self.state_dir() / f"{session}.{suffix}"
 
-    def gate(self, session, prompt=GATED_PROMPT, **extra_env):
+    def gate(self, session, prompt=GATED_PROMPT, turn=None, **extra_env):
+        payload = {"prompt": prompt, "cwd": str(self.repo), "session_id": session}
+        if turn:
+            payload["turn_id"] = turn
         res = self.run_hook(
-            USERPROMPT_HOOK, {"prompt": prompt, "cwd": str(self.repo), "session_id": session}, **extra_env
+            USERPROMPT_HOOK, payload, **extra_env
         )
         self.assertEqual(res.returncode, 0, res.stderr)
         self.clear_log()
         return res
 
-    def stop(self, session, **extra_env):
-        return self.run_hook(
-            STOP_HOOK, {"cwd": str(self.repo), "session_id": session, "stop_hook_active": False}, **extra_env
-        )
+    def stop(self, session, turn=None, **extra_env):
+        payload = {"cwd": str(self.repo), "session_id": session, "stop_hook_active": False}
+        if turn:
+            payload["turn_id"] = turn
+        return self.run_hook(STOP_HOOK, payload, **extra_env)
+
+    def subagent_stop(self, session, agent_id, message="research result", turn=None, **extra_env):
+        payload = {
+            "cwd": str(self.repo),
+            "session_id": session,
+            "stop_hook_active": False,
+            "agent_id": agent_id,
+            "agent_type": "research",
+            "agent_transcript_path": "/MUST/NOT/BE/READ/transcript.jsonl",
+            "last_assistant_message": message,
+        }
+        if turn:
+            payload["turn_id"] = turn
+        return self.run_hook(SUBAGENT_STOP_HOOK, payload, **extra_env)
 
     def modify_repo(self, text="hello\nchanged\n"):
         (self.repo / "README.md").write_text(text, encoding="utf-8")
@@ -209,9 +366,27 @@ class HookTestCase(unittest.TestCase):
         context = payload["hookSpecificOutput"]["additionalContext"]
         self.assertIn("AUTOMATIC CLAUDE FUSION CONTEXT", context)
         self.assertIn("analysis from fake claude", context)
+        consults = self.consults()
+        self.assertEqual(len(consults), 1)
+        self.assertEqual((consults[0]["model"], consults[0]["effort"]), ("fable", "xhigh"))
         marker = self.marker("gate")
         self.assertTrue(marker.exists())
         self.assertEqual(marker.read_text(encoding="utf-8").strip(), self.head_sha())
+
+    def test_primary_overrides_do_not_change_fixed_fallback(self):
+        res = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": GATED_PROMPT, "cwd": str(self.repo), "session_id": "override"},
+            CLAUDE_FUSION_MODEL="sonnet",
+            CLAUDE_FUSION_EFFORT="low",
+            FAKE_CLAUDE_FAIL_MODEL="sonnet",
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        context = json.loads(res.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("analysis from fake claude", context)
+        consults = self.consults()
+        self.assertEqual([entry["model"] for entry in consults], ["sonnet", "opus"])
+        self.assertEqual([entry["effort"] for entry in consults], ["low", "xhigh"])
 
     def test_gate_skips_trivial_conversational_and_escape_hatch(self):
         for prompt in (
@@ -227,6 +402,10 @@ class HookTestCase(unittest.TestCase):
             self.assertEqual(res.stdout, "", prompt)
         self.assertFalse(self.marker("skipgate").exists())
         self.assertEqual(self.consults(), [])
+        sub = self.subagent_stop("skipgate", "agent-skipped")
+        final = self.stop("skipgate")
+        self.assertEqual((sub.stdout, final.stdout), ("", ""))
+        self.assertEqual(self.consults(), [], "[no-claude] parent turns suppress subagent and final reviews")
 
     def test_marker_lifecycle_pass_consumes_marker(self):
         self.gate("pass")
@@ -245,7 +424,7 @@ class HookTestCase(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         payload = json.loads(res.stdout)
         self.assertEqual(payload["decision"], "block")
-        self.assertIn("review details", payload["reason"])
+        self.assertIn("serious review detail", payload["reason"])
         self.assertFalse(self.marker("block").exists())
 
         self.clear_log()
@@ -259,10 +438,11 @@ class HookTestCase(unittest.TestCase):
     def test_retry_on_failure_not_on_timeout(self):
         self.gate("retry")
         self.modify_repo()
-        res = self.stop("retry", FAKE_CLAUDE_FAIL_MODEL="1")
+        res = self.stop("retry", FAKE_CLAUDE_FAIL_MODEL="fable")
         self.assertEqual(res.returncode, 0, res.stderr)
         consults = self.consults()
-        self.assertEqual([entry["has_model"] for entry in consults], [True, False])
+        self.assertEqual([entry["model"] for entry in consults], ["fable", "opus"])
+        self.assertEqual([entry["effort"] for entry in consults], ["xhigh", "xhigh"])
 
         def allowed_tools(argv):
             return argv[argv.index("--allowedTools") + 1] if "--allowedTools" in argv else None
@@ -343,6 +523,18 @@ class HookTestCase(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertEqual(len(self.help_calls()), 1, "binary change must invalidate the probe cache")
 
+    def test_existing_state_directory_permissions_are_hardened(self):
+        state = self.state_dir()
+        state.mkdir(mode=0o777)
+        state.chmod(0o777)
+        res = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": GATED_PROMPT, "cwd": str(self.repo), "session_id": "state-mode"},
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(state.stat().st_mode & 0o777, 0o700)
+        self.assertTrue(self.marker("state-mode").exists())
+
     def test_empty_probe_output_is_not_cached(self):
         res = self.run_hook(
             USERPROMPT_HOOK,
@@ -408,12 +600,12 @@ class HookTestCase(unittest.TestCase):
 
         first = self.stop("cap", **extra)
         self.assertEqual(first.returncode, 0, first.stderr)
-        self.assertEqual(len(self.consults()), 2, "model attempt + default-model retry")
+        self.assertEqual(len(self.consults()), 3, "two structured attempts + final Opus text fallback")
         self.clear_log()
 
         second = self.stop("cap", **extra)
         self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertEqual(len(self.consults()), 2)
+        self.assertEqual(len(self.consults()), 3)
         self.clear_log()
 
         third = self.stop("cap", **extra)
@@ -501,9 +693,282 @@ class HookTestCase(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         payload = json.loads(res.stdout)
         self.assertEqual(payload["decision"], "block", "a >128KiB review must not be dropped by the env handoff")
-        self.assertIn("review details", payload["reason"])
+        self.assertIn("serious review detail", payload["reason"])
         self.assertFalse(self.marker("hugereview").exists())
         self.assertTrue(self.state_file("hugereview", "reviewed").exists())
+
+    def test_nongit_cwd_warns_once_per_session(self):
+        plain = self.base / "plain"
+        plain.mkdir()
+        res = self.run_hook(
+            USERPROMPT_HOOK, {"prompt": GATED_PROMPT, "cwd": str(plain), "session_id": "nogit"}
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        payload = json.loads(res.stdout)
+        context = payload["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("not a git repository", payload["systemMessage"])
+        self.assertIn("analysis from fake claude", context, "the warning must not displace the consult")
+        self.assertTrue(self.state_file("nogit", "nogit-warned").exists())
+
+        self.clear_log()
+        res = self.run_hook(
+            USERPROMPT_HOOK, {"prompt": GATED_PROMPT, "cwd": str(plain), "session_id": "nogit"}
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        payload = json.loads(res.stdout)
+        context = payload["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("systemMessage", payload, "the warning must fire once per session")
+
+    def test_nongit_cwd_warns_on_skip_paths(self):
+        plain = self.base / "plain"
+        plain.mkdir()
+        res = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": GATED_PROMPT + " [no-claude]", "cwd": str(plain), "session_id": "nogitskip"},
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        payload = json.loads(res.stdout)
+        self.assertIn("not a git repository", payload["systemMessage"])
+        self.assertNotIn("hookSpecificOutput", payload)
+        self.assertEqual(self.consults(), [], "[no-claude] must still skip the consult")
+        self.assertTrue(self.state_file("nogitskip", "nogit-warned").exists())
+
+        # In a git repo the skip paths must stay completely silent (no warning-only payload).
+        res = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": GATED_PROMPT + " [no-claude]", "cwd": str(self.repo), "session_id": "gitskip"},
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+
+    def test_structured_envelope_and_ephemeral_defaults(self):
+        res = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": GATED_PROMPT, "cwd": str(self.repo), "session_id": "structured", "turn_id": "t1"},
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn("analysis from fake claude", res.stdout)
+        consult = self.consults()[0]
+        self.assertEqual(consult["argv"][consult["argv"].index("--output-format") + 1], "json")
+        self.assertIn("--json-schema", consult["argv"])
+        self.assertIn("--no-session-persistence", consult["argv"])
+        self.assertNotIn("--resume", consult["argv"])
+        self.assertTrue(self.marker("structured", "t1").exists())
+
+    def test_structured_failures_exhaust_to_fixed_text_fallback(self):
+        cases = (
+            "FAKE_CLAUDE_MALFORMED",
+            "FAKE_CLAUDE_IS_ERROR",
+            "FAKE_CLAUDE_MISSING_STRUCTURED",
+            "FAKE_CLAUDE_BAD_CONTRACT",
+            "FAKE_CLAUDE_SUBTYPE",
+        )
+        for index, flag in enumerate(cases):
+            with self.subTest(flag=flag):
+                self.clear_log()
+                res = self.run_hook(
+                    USERPROMPT_HOOK,
+                    {"prompt": GATED_PROMPT, "cwd": str(self.repo), "session_id": f"bad-{index}"},
+                    **{flag: "error" if flag == "FAKE_CLAUDE_SUBTYPE" else "1"},
+                )
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertIn("analysis from fake claude", res.stdout)
+                consults = self.consults()
+                self.assertEqual([c["model"] for c in consults], ["fable", "opus", "opus"])
+                self.assertEqual(
+                    [c["argv"][c["argv"].index("--output-format") + 1] for c in consults],
+                    ["json", "json", "text"],
+                )
+
+    def test_legacy_client_keeps_two_attempt_text_path(self):
+        res = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": GATED_PROMPT, "cwd": str(self.repo), "session_id": "legacy-client"},
+            FAKE_CLAUDE_NO_STRUCTURED="1",
+            FAKE_CLAUDE_FAIL_MODEL="fable",
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        consults = self.consults()
+        self.assertEqual([c["model"] for c in consults], ["fable", "opus"])
+        self.assertTrue(all("--json-schema" not in c["argv"] for c in consults))
+        self.assertTrue(all(c["argv"][c["argv"].index("--output-format") + 1] == "text" for c in consults))
+
+    def test_question_contract_and_no_timer_instructions(self):
+        questions = [
+            {
+                "importance": "required",
+                "header": "Storage",
+                "prompt": "Which storage backend should be authoritative?",
+                "options": [
+                    {"label": "SQLite", "description": "Simple local persistence."},
+                    {"label": "Postgres", "description": "Shared production persistence."},
+                ],
+                "recommendation": "Postgres",
+            },
+            {
+                "importance": "advisory",
+                "header": "Rollout",
+                "prompt": "How should this be released?",
+                "options": [
+                    {"label": "Gradual", "description": "Lower operational risk."},
+                    {"label": "Immediate", "description": "Faster availability."},
+                ],
+                "recommendation": "Gradual",
+            },
+        ]
+        res = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": GATED_PROMPT, "cwd": str(self.repo), "session_id": "questions"},
+            FAKE_CLAUDE_QUESTIONS=json.dumps(questions),
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        context = json.loads(res.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Question 1 [required]", context)
+        self.assertIn("Question 2 [advisory]", context)
+        self.assertIn("remove anything answerable", context)
+        self.assertIn("Ask no more than three", context)
+        self.assertIn("omit autoResolutionMs entirely", context)
+        self.assertIn("end the turn with the unresolved questions and wait", context)
+        prompt = self.consults()[0]["prompt"]
+        self.assertIn("Do not ask anything Codex can answer by inspecting the repository", prompt)
+        self.assertIn("Merge overlapping questions", prompt)
+
+        self.clear_log()
+        too_many = questions + questions
+        rejected = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": GATED_PROMPT, "cwd": str(self.repo), "session_id": "too-many-questions"},
+            FAKE_CLAUDE_QUESTIONS=json.dumps(too_many),
+        )
+        self.assertEqual(rejected.returncode, 0, rejected.stderr)
+        rejected_context = json.loads(rejected.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("BEGIN CLAUDE QUESTIONS", rejected_context)
+        self.assertEqual(len(self.consults()), 3, "more than three questions invalidates both structured attempts")
+
+    def test_turn_scoped_markers_and_legacy_fallback(self):
+        self.gate("turns", turn="one")
+        self.gate("turns", turn="two")
+        self.modify_repo()
+        first = self.stop("turns", turn="one")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertFalse(self.marker("turns", "one").exists())
+        self.assertTrue(self.marker("turns", "two").exists())
+
+        self.clear_log()
+        second = self.stop("turns", turn="two")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(len(self.consults()), 1, "a separate parent turn must receive its own final review")
+
+        state = self.state_dir()
+        state.mkdir(mode=0o700, exist_ok=True)
+        self.marker("legacy-marker").write_text(self.head_sha() + "\n", encoding="utf-8")
+        self.modify_repo("hello\nlegacy marker change\n")
+        self.clear_log()
+        legacy = self.stop("legacy-marker", turn="new-codex-turn")
+        self.assertEqual(legacy.returncode, 0, legacy.stderr)
+        self.assertEqual(len(self.consults()), 1)
+        self.assertFalse(self.marker("legacy-marker").exists())
+
+    def test_optional_continuity_resumes_and_recovers_fresh(self):
+        first = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": GATED_PROMPT, "cwd": str(self.repo), "session_id": "continuity", "turn_id": "one"},
+            CLAUDE_FUSION_CONTINUITY="1",
+        )
+        self.assertEqual(first.returncode, 0, first.stderr)
+        consult = self.consults()[0]
+        self.assertNotIn("--no-session-persistence", consult["argv"])
+        self.assertNotIn("--resume", consult["argv"])
+        mapping = self.state_file("continuity", "claude-session")
+        self.assertEqual(mapping.read_text(encoding="utf-8").strip(), "fake-session-id")
+
+        self.clear_log()
+        second = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": GATED_PROMPT, "cwd": str(self.repo), "session_id": "continuity", "turn_id": "two"},
+            CLAUDE_FUSION_CONTINUITY="1",
+            FAKE_CLAUDE_FAIL_RESUME="1",
+        )
+        self.assertEqual(second.returncode, 0, second.stderr)
+        consults = self.consults()
+        self.assertEqual(len(consults), 2)
+        self.assertIn("--resume", consults[0]["argv"])
+        self.assertNotIn("--resume", consults[1]["argv"])
+        self.assertEqual(mapping.read_text(encoding="utf-8").strip(), "fake-session-id")
+
+        self.modify_repo()
+        self.clear_log()
+        final_review = self.stop("continuity", turn="two", CLAUDE_FUSION_CONTINUITY="1")
+        self.assertEqual(final_review.returncode, 0, final_review.stderr)
+        review_args = self.consults()[0]["argv"]
+        self.assertIn("--no-session-persistence", review_args)
+        self.assertNotIn("--resume", review_args)
+
+    def test_subagent_reviews_research_message_without_transcript(self):
+        self.gate("subresearch", turn="parent")
+        res = self.subagent_stop("subresearch", "agent-a", "Evidence-based research conclusion", turn="parent")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+        consults = self.consults()
+        self.assertEqual(len(consults), 1)
+        prompt = consults[0]["prompt"]
+        self.assertIn("Evidence-based research conclusion", prompt)
+        self.assertIn("Research-only subagents still require review", prompt)
+        self.assertNotIn("/MUST/NOT/BE/READ", prompt)
+        self.assertNotIn("agent_transcript_path", prompt)
+
+    def test_subagent_issue_blocks_and_message_is_character_capped(self):
+        self.gate("subblock", turn="parent")
+        message = "é" * 13000 + "TRANSCRIPT_TAIL_MUST_NOT_APPEAR"
+        res = self.subagent_stop(
+            "subblock", "agent-b", message, turn="parent", FAKE_CLAUDE_VERDICT="ISSUES_FOUND"
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        payload = json.loads(res.stdout)
+        self.assertEqual(payload["decision"], "block")
+        self.assertIn("serious review detail", payload["reason"])
+        prompt = self.consults()[0]["prompt"]
+        self.assertIn("truncated at 12000 characters", prompt)
+        self.assertNotIn("TRANSCRIPT_TAIL_MUST_NOT_APPEAR", prompt)
+
+    def test_subagent_cap_deduplicates_and_final_stop_still_runs(self):
+        self.gate("subcap", turn="parent")
+        self.modify_repo()
+        first = self.subagent_stop("subcap", "agent-1", turn="parent")
+        duplicate = self.subagent_stop("subcap", "agent-1", turn="parent")
+        second = self.subagent_stop("subcap", "agent-2", turn="parent")
+        capped = self.subagent_stop("subcap", "agent-3", turn="parent")
+        for res in (first, duplicate, second, capped):
+            self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(len(self.consults()), 2, "duplicate events and agents beyond the cap must not consult")
+
+        final = self.stop("subcap", turn="parent")
+        self.assertEqual(final.returncode, 0, final.stderr)
+        self.assertEqual(len(self.consults()), 3, "SubagentStop reviews must never replace the main final diff review")
+        reservations = list(self.state_dir().glob("subcap.parent.subagent-*"))
+        self.assertEqual(reservations, [], "a definitive main review should clean turn-scoped reservations")
+
+    def test_subagent_guards_and_fail_open(self):
+        self.gate("subguards", turn="parent")
+        disabled = self.subagent_stop(
+            "subguards", "disabled", turn="parent", CLAUDE_FUSION_SUBAGENT_REVIEW="0"
+        )
+        self.assertEqual(disabled.stdout, "")
+        self.assertEqual(self.consults(), [])
+
+        active = self.run_hook(
+            SUBAGENT_STOP_HOOK,
+            {
+                "cwd": str(self.repo), "session_id": "subguards", "turn_id": "parent",
+                "stop_hook_active": True, "agent_id": "loop", "last_assistant_message": "result",
+            },
+        )
+        self.assertEqual(active.stdout, "")
+        self.assertEqual(self.consults(), [])
+
+        failed = self.subagent_stop("subguards", "failure", turn="parent", FAKE_CLAUDE_RC="1")
+        self.assertEqual(failed.returncode, 0, failed.stderr)
+        self.assertEqual(failed.stdout, "", "Claude failures must remain fail-open")
 
     def test_installer_idempotent_and_home_norm(self):
         codex_dir = self.home / ".codex"
@@ -525,9 +990,9 @@ class HookTestCase(unittest.TestCase):
         }
         (codex_dir / "hooks.json").write_text(json.dumps(seed), encoding="utf-8")
         env = self.env()
-        first = subprocess.run([str(INSTALL)], cwd=ROOT, text=True, capture_output=True, env=env, timeout=30)
+        first = subprocess.run([str(INSTALL), "--legacy"], cwd=ROOT, text=True, capture_output=True, env=env, timeout=30)
         self.assertEqual(first.returncode, 0, first.stderr)
-        second = subprocess.run([str(INSTALL)], cwd=ROOT, text=True, capture_output=True, env=env, timeout=30)
+        second = subprocess.run([str(INSTALL), "--legacy"], cwd=ROOT, text=True, capture_output=True, env=env, timeout=30)
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertIn("nothing to change", second.stdout)
 
@@ -539,8 +1004,195 @@ class HookTestCase(unittest.TestCase):
         self.assertEqual(ups[0]["timeout"], 660)
         stops = [h for g in container["Stop"] for h in g["hooks"] if "claude-fusion" in h["command"]]
         self.assertEqual(len(stops), 1)
-        for name in ("claude-fusion-common.sh", "claude-fusion-userprompt.sh", "claude-fusion-stop.sh"):
+        substops = [h for g in container["SubagentStop"] for h in g["hooks"] if "claude-fusion" in h["command"]]
+        self.assertEqual(len(substops), 1)
+        for name in ("claude-fusion-common.sh", "claude-fusion-userprompt.sh", "claude-fusion-subagent-stop.sh", "claude-fusion-stop.sh"):
             self.assertTrue((codex_dir / "hooks" / name).exists(), name)
+
+    def test_plugin_manifest_marketplace_and_default_hook_discovery(self):
+        if PLUGIN_VALIDATOR:
+            validator = Path(PLUGIN_VALIDATOR)
+            self.assertTrue(validator.is_file(), f"configured plugin validator does not exist: {validator}")
+            validated = subprocess.run(
+                ["python3", str(validator), str(PLUGIN_ROOT)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+            self.assertEqual(validated.returncode, 0, validated.stdout + validated.stderr)
+
+        manifest = json.loads((PLUGIN_ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["name"], "claude-fusion")
+        self.assertEqual(manifest["version"], "0.1.0")
+        self.assertEqual(manifest["license"], "MIT")
+        self.assertIn("Read-only analysis", manifest["interface"]["capabilities"])
+        self.assertNotIn("hooks", manifest, "hooks/hooks.json must be found through default discovery")
+
+        hooks = json.loads((PLUGIN_ROOT / "hooks" / "hooks.json").read_text(encoding="utf-8"))["hooks"]
+        self.assertEqual(set(hooks), {"UserPromptSubmit", "SubagentStop", "Stop"})
+        for event, groups in hooks.items():
+            entries = [hook for group in groups for hook in group["hooks"]]
+            self.assertEqual(len(entries), 1, event)
+            self.assertTrue(entries[0]["command"].startswith("${PLUGIN_ROOT}/hooks/"))
+            self.assertIn("read-only", entries[0]["statusMessage"])
+
+        marketplace = json.loads((ROOT / ".agents" / "plugins" / "marketplace.json").read_text(encoding="utf-8"))
+        self.assertEqual(marketplace["name"], "claude-fusion")
+        entry = marketplace["plugins"][0]
+        self.assertEqual(entry["source"], {"source": "local", "path": "./plugins/claude-fusion"})
+        self.assertEqual(entry["policy"], {"installation": "AVAILABLE", "authentication": "ON_INSTALL"})
+        self.assertEqual(entry["category"], "Productivity")
+
+    def test_local_plugin_install_migrates_legacy_only_after_verification(self):
+        state = self._write_fake_codex()
+        env = self.env(FAKE_CODEX_STATE=str(state))
+        legacy = subprocess.run(
+            [str(INSTALL), "--legacy"], cwd=ROOT, text=True, capture_output=True, env=env, timeout=30
+        )
+        self.assertEqual(legacy.returncode, 0, legacy.stdout + legacy.stderr)
+        hooks_file = self.home / ".codex" / "hooks.json"
+        self.assertIn("claude-fusion", hooks_file.read_text(encoding="utf-8"))
+
+        plugin = subprocess.run(
+            [str(INSTALL), "--local"], cwd=ROOT, text=True, capture_output=True, env=env, timeout=30
+        )
+        self.assertEqual(plugin.returncode, 0, plugin.stdout + plugin.stderr)
+        installed = json.loads(state.read_text(encoding="utf-8"))
+        self.assertTrue(installed["installed"])
+        self.assertEqual(Path(installed["marketplace"]).resolve(), ROOT.resolve())
+        self.assertNotIn("claude-fusion", hooks_file.read_text(encoding="utf-8"))
+        self.assertTrue(Path(str(hooks_file) + ".claude-fusion.bak").exists())
+        self.assertFalse((self.home / ".codex" / "hooks" / "claude-fusion-userprompt.sh").exists())
+        self.assertIn("MANDATORY HUMAN GATE", plugin.stdout)
+
+    def test_failed_plugin_install_preserves_legacy_installation(self):
+        state = self._write_fake_codex()
+        env = self.env(FAKE_CODEX_STATE=str(state))
+        legacy = subprocess.run(
+            [str(INSTALL), "--legacy"], cwd=ROOT, text=True, capture_output=True, env=env, timeout=30
+        )
+        self.assertEqual(legacy.returncode, 0, legacy.stdout + legacy.stderr)
+        hooks_file = self.home / ".codex" / "hooks.json"
+        before = hooks_file.read_bytes()
+
+        failed = subprocess.run(
+            [str(INSTALL), "--local"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            env=self.env(FAKE_CODEX_STATE=str(state), FAKE_CODEX_FAIL_ADD="1"),
+            timeout=30,
+        )
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertEqual(hooks_file.read_bytes(), before, "failed plugin verification must not strip legacy hooks")
+        self.assertTrue((self.home / ".codex" / "hooks" / "claude-fusion-userprompt.sh").exists())
+
+    def test_remote_install_uses_github_marketplace_source(self):
+        state = self._write_fake_codex()
+        result = subprocess.run(
+            [str(INSTALL)],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            env=self.env(FAKE_CODEX_STATE=str(state)),
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        installed = json.loads(state.read_text(encoding="utf-8"))
+        self.assertEqual(installed["marketplace"], "tharanee-bit/Claude-Fusion")
+        self.assertEqual(installed["marketplace_type"], "git")
+        self.assertTrue(installed["installed"])
+
+        state.write_text(
+            json.dumps({"marketplace": str(self.base / "old-local-clone"), "marketplace_type": "local", "installed": False}),
+            encoding="utf-8",
+        )
+        migrated = subprocess.run(
+            [str(INSTALL)],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            env=self.env(FAKE_CODEX_STATE=str(state)),
+            timeout=30,
+        )
+        self.assertEqual(migrated.returncode, 0, migrated.stdout + migrated.stderr)
+        self.assertEqual(json.loads(state.read_text(encoding="utf-8"))["marketplace"], "tharanee-bit/Claude-Fusion")
+
+    def test_uninstall_keeps_marketplace_unless_purged(self):
+        state = self._write_fake_codex()
+        env = self.env(FAKE_CODEX_STATE=str(state))
+        installed = subprocess.run(
+            [str(INSTALL), "--local"], cwd=ROOT, text=True, capture_output=True, env=env, timeout=30
+        )
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+
+        removed = subprocess.run(
+            [str(UNINSTALL)], cwd=ROOT, text=True, capture_output=True, env=env, timeout=30
+        )
+        self.assertEqual(removed.returncode, 0, removed.stdout + removed.stderr)
+        after = json.loads(state.read_text(encoding="utf-8"))
+        self.assertFalse(after["installed"])
+        self.assertIsNotNone(after["marketplace"])
+
+        purged = subprocess.run(
+            [str(UNINSTALL), "--purge-marketplace"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=30,
+        )
+        self.assertEqual(purged.returncode, 0, purged.stdout + purged.stderr)
+        self.assertIsNone(json.loads(state.read_text(encoding="utf-8"))["marketplace"])
+
+    def test_uninstall_preserves_legacy_files_when_hooks_json_is_invalid(self):
+        codex_dir = self.home / ".codex"
+        hooks_dir = codex_dir / "hooks"
+        hooks_dir.mkdir(parents=True)
+        legacy_hook = hooks_dir / "claude-fusion-userprompt.sh"
+        legacy_hook.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+        (codex_dir / "hooks.json").write_text("{invalid", encoding="utf-8")
+
+        result = subprocess.run(
+            [str(UNINSTALL)],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            env=self.env(),
+            timeout=30,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue(legacy_hook.exists(), "invalid registration data must not leave a dangling command")
+        self.assertIn("Legacy hook files were also left in place", result.stderr)
+
+    def test_doctor_is_read_only_and_reports_trust_gate(self):
+        state = self._write_fake_codex()
+        env = self.env(FAKE_CODEX_STATE=str(state))
+        installed = subprocess.run(
+            [str(INSTALL), "--local"], cwd=ROOT, text=True, capture_output=True, env=env, timeout=30
+        )
+        self.assertEqual(installed.returncode, 0, installed.stdout + installed.stderr)
+
+        def snapshot(path):
+            if not path.exists():
+                return {}
+            return {
+                str(item.relative_to(path)): (item.stat().st_mode, item.read_bytes())
+                for item in path.rglob("*")
+                if item.is_file()
+            }
+
+        codex_home = self.home / ".codex"
+        before = snapshot(codex_home)
+        result = subprocess.run(
+            [str(DOCTOR), "plugin"], cwd=ROOT, text=True, capture_output=True, env=env, timeout=30
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(snapshot(codex_home), before)
+        self.assertIn("No files were changed", result.stdout)
+        self.assertIn("MANDATORY HUMAN GATE", result.stdout)
+        self.assertIn("Claude supports --json-schema", result.stdout)
 
 
 if __name__ == "__main__":
