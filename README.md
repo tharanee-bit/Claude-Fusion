@@ -137,7 +137,7 @@ absolute paths in `--legacy` mode, so this caveat only applies to a manual merge
 | `CLAUDE_FUSION_CONTINUITY` | `0` | `1` = persist and resume only the UserPromptSubmit Claude session. Invalid saved sessions are discarded and retried fresh. Stop and SubagentStop reviews always remain fresh. |
 | `CLAUDE_FUSION_SUBAGENT_REVIEW` | `1` | `0` disables SubagentStop review without disabling pre-prompt or final review. |
 | `CLAUDE_FUSION_SUBAGENT_REVIEW_LIMIT` | `2` | Maximum unique subagent reviews atomically reserved per gated parent turn. |
-| `CLAUDE_FUSION_TIMEOUT` | `600` (workflow) / `300` (single) | Internal timeout (seconds) around the `claude` call. |
+| `CLAUDE_FUSION_TIMEOUT` | `600` (workflow) / `300` (single) | Shared whole-hook budget (seconds) across all Claude attempts; values above 630 are capped so cleanup completes before Codex's 660s hook timeout. |
 | `CLAUDE_FUSION_STOP_RETRY_LIMIT` | `2` | Transient failed Stop-review attempts for an unchanged diff before skipping until the diff changes. |
 | `CLAUDE_FUSION_EXCLUDE` | - | Extra space-separated globs to exclude from the status/diff sent to Claude, on top of the built-in sensitive-path denylist (globs containing spaces are unsupported). |
 | `CLAUDE_FUSION_MAX_FILE_BYTES` | `409600` | Per-file size cap; changed files larger than this are dropped from the diff payload. |
@@ -147,15 +147,16 @@ absolute paths in `--legacy` mode, so this caveat only applies to a manual merge
 > Fable at `xhigh`. Structured-capable clients then try the latest Opus alias at `xhigh`, followed
 > by one final Opus text attempt after malformed structured exhaustion. Older clients retain the
 > original two-attempt Fable/Opus text path. The fallback is fixed even when the primary model or
-> effort is overridden. Timeouts are not retried. By default, Claude Code `--safe-mode` keeps the consult
+> effort is overridden. All attempts share one bounded wall-clock budget; timeouts are not retried.
+> By default, Claude Code `--safe-mode` keeps the consult
 > focused on the injected task and repository context rather than your personal Claude setup.
 > **This costs latency:** a complex prompt waits for Claude (often 1-3 minutes, sometimes longer in
 > `workflow` mode) before Codex responds. To deliberately trade isolation for local Claude
 > workflows, set
 > `CLAUDE_FUSION_SAFE_MODE=0`. To trade quality for speed, set `CLAUDE_FUSION_DEPTH=single`, lower
 > `CLAUDE_FUSION_EFFORT`, or use `[no-claude]` to skip a given prompt. The hook-registration timeout
-> in `hooks.json` (660s) sits above the internal
-> timeout; if your Codex build caps hook timeouts lower and `workflow` analyses get killed, use
+> in `hooks.json` (660s) sits above the maximum 630-second shared budget; if your Codex build caps
+> hook timeouts lower and `workflow` analyses get killed, use
 > `single` mode or a smaller `CLAUDE_FUSION_TIMEOUT`.
 
 ### The trigger gate
@@ -253,7 +254,7 @@ Other hooks and settings are untouched, and changed `hooks.json` files are backe
 
 ```
 .agents/plugins/marketplace.json                    # repo marketplace named claude-fusion
-plugins/claude-fusion/.codex-plugin/plugin.json     # v0.1.0 plugin manifest
+plugins/claude-fusion/.codex-plugin/plugin.json     # v0.1.1 plugin manifest
 plugins/claude-fusion/hooks/hooks.json              # default-discovered three-hook registration
 plugins/claude-fusion/hooks/*.sh                    # canonical runtime
 plugins/claude-fusion/skills/claude-fusion-auto/    # authoritative synthesis/question skill

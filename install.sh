@@ -96,6 +96,11 @@ if removed:
         raise
     print(f"Removed {removed} legacy hook registration(s); backup: {path}.claude-fusion.bak")
 PY
+    _legacy_cleanup_rc=$?
+    if [ "$_legacy_cleanup_rc" -ne 0 ]; then
+      echo "ERROR: legacy hooks.json cleanup failed; legacy files were preserved." >&2
+      return "$_legacy_cleanup_rc"
+    fi
   fi
   rm -f "$HOOKS_DIR/claude-fusion-common.sh" "$HOOKS_DIR/claude-fusion-userprompt.sh" \
     "$HOOKS_DIR/claude-fusion-subagent-stop.sh" "$HOOKS_DIR/claude-fusion-stop.sh"

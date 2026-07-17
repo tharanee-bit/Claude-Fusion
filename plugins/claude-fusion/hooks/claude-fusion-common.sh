@@ -27,10 +27,13 @@ clf_init_common() {
   esac
   CUSTOM_CLAUDE_CONTEXT=0
   [ "${#CLAUDE_SAFE_ARGS[@]}" -eq 0 ] && CUSTOM_CLAUDE_CONTEXT=1
-  # Workflow-depth analyses are slow; give them headroom. The internal timeout bounds the claude call;
-  # the hook-registration timeout in hooks.json must sit comfortably above it (see install.sh / README).
+  # Workflow-depth analyses are slow; give them headroom. This is one shared whole-hook budget for
+  # every Claude attempt, not a fresh timeout per retry. Cap overrides below the registered 660s
+  # hook timeout so Codex cannot kill the shell before it records a bounded fail-open outcome.
   if [ "$DEPTH" = "workflow" ]; then DEF_TIMEOUT=600; else DEF_TIMEOUT=300; fi
-  CLAUDE_TIMEOUT="${CLAUDE_FUSION_TIMEOUT:-$DEF_TIMEOUT}"
+  CLAUDE_TIMEOUT="$(clf_positive_int "${CLAUDE_FUSION_TIMEOUT:-$DEF_TIMEOUT}" "$DEF_TIMEOUT")"
+  [ "$CLAUDE_TIMEOUT" -le 630 ] || CLAUDE_TIMEOUT=630
+  CLF_HOOK_STARTED="${SECONDS:-0}"
   CLF_MAX_FILE_BYTES="$(clf_positive_int "${CLAUDE_FUSION_MAX_FILE_BYTES:-409600}" 409600)"
   # Paths matched (lowercased, basename and full relative path) against these globs are dropped from
   # every git status and diff before anything is handed to Claude. Extend with CLAUDE_FUSION_EXCLUDE
@@ -310,9 +313,16 @@ clf_set_claude_args() {
 }
 
 clf_run_claude() {
-  # Read-only Claude invocation. plan mode forbids edits; the timeout wrapper guarantees the hook
-  # can never hang Codex. Both Fusion-active flags mark the subtree so nested hooks short-circuit.
-  printf '%s' "$CLAUDE_PROMPT" | CLAUDE_FUSION_ACTIVE=1 CODEX_FUSION_ACTIVE=1 timeout "$CLAUDE_TIMEOUT" \
+  # Read-only Claude invocation. Every retry consumes the same budget captured at hook start; once
+  # exhausted return timeout semantics without starting another process. Both Fusion-active flags
+  # mark the subtree so nested hooks short-circuit.
+  _rc_elapsed=$(( ${SECONDS:-0} - ${CLF_HOOK_STARTED:-0} ))
+  _rc_remaining=$(( CLAUDE_TIMEOUT - _rc_elapsed ))
+  if [ "$_rc_remaining" -le 0 ]; then
+    clf_dbg "shared hook budget exhausted before Claude attempt"
+    return 124
+  fi
+  printf '%s' "$CLAUDE_PROMPT" | CLAUDE_FUSION_ACTIVE=1 CODEX_FUSION_ACTIVE=1 timeout "$_rc_remaining" \
     "$CLAUDE_BIN" "${CLAUDE_ARGS[@]}" 2>/dev/null
 }
 

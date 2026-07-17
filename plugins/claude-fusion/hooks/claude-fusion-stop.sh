@@ -37,8 +37,11 @@ MARKER="$(clf_find_complex_marker "$SESSION_ID" "$TURN_ID")"
 [ -n "$MARKER" ] || { clf_dbg "no complex marker -> exit"; exit 0; }
 STATE_KEY="$TURN_KEY"
 [ -n "$STATE_KEY" ] || STATE_KEY="$SESSION_ID"
-REVIEWED_FILE="$STATE_DIR/$STATE_KEY.reviewed"
-FAILED_FILE="$STATE_DIR/$STATE_KEY.failed-review"
+# Complex baselines and subagent reservations are turn-scoped, but these two files deliberately
+# span turns: a later gated prompt in the same session must not re-review (or retry forever on) the
+# exact same working-tree diff merely because modern Codex supplied a new turn_id.
+REVIEWED_FILE="$STATE_DIR/$SESSION_ID.reviewed"
+FAILED_FILE="$STATE_DIR/$SESSION_ID.failed-review"
 
 # Diff against the prompt-time HEAD recorded in the marker, not the current one, so commits made
 # during the turn stay in the review surface. Empty/unresolvable marker content (pre-upgrade format,
