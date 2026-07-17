@@ -1,9 +1,9 @@
-# Claude Fusion (optional AGENTS.md guidance)
+# Claude Fusion (historical manual snippet; not recommended)
 
-Append this section to `~/.codex/AGENTS.md` (global) or a project `AGENTS.md` if you want the
-synthesis guidance always present, independent of the per-prompt injection. It is optional: the
-`claude-fusion-userprompt.sh` hook already injects a self-contained preamble on every consult, and
-the `claude-fusion-auto` skill carries the same process.
+Do not append this section to shared `AGENTS.md` or `CLAUDE.md` files for a normal installation.
+Claude Fusion's injected context and bundled `claude-fusion-auto` skill are authoritative, avoid
+always-on token cost, and preserve Claude Code `--safe-mode` isolation. This file remains only for
+compatibility with older manual-install documentation.
 
 ---
 

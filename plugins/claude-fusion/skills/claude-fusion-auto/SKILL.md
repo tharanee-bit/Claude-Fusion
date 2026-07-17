@@ -1,6 +1,6 @@
 ---
 name: claude-fusion-auto
-description: "Synthesize Codex's own coding plan with the independent Claude analysis injected by Claude Fusion. Use whenever an 'AUTOMATIC CLAUDE FUSION CONTEXT' or 'AUTOMATIC CLAUDE FUSION - POST-DIFF REVIEW' block is present: complex coding tasks, architecture, debugging, refactors, migrations, security-sensitive changes, API design, and substantial code review. The user does not need to name this skill."
+description: "Synthesize Codex's own coding plan with the independent Claude analysis injected by Claude Fusion. Use whenever an 'AUTOMATIC CLAUDE FUSION CONTEXT', 'AUTOMATIC CLAUDE FUSION - SUBAGENT REVIEW', or 'AUTOMATIC CLAUDE FUSION - POST-DIFF REVIEW' block is present: complex coding tasks, architecture, debugging, refactors, migrations, security-sensitive changes, API design, and substantial code review. The user does not need to name this skill."
 ---
 
 # Claude Fusion - automatic synthesis
@@ -21,6 +21,23 @@ analysis you must reconcile with your own **before making any edits**.
    a sound reason, and say so.
 4. Prefer **minimal, testable** changes.
 5. After editing, run the relevant **tests / lint / typecheck** for the project.
+
+## Clarification questions
+Claude may attach up to three structured questions to its analysis. Before asking the user:
+
+1. Inspect the repository and remove questions Codex can answer from repo truth.
+2. Merge duplicates and overlapping choices.
+3. Ask every remaining `required` question before editing. An `advisory` question may be promoted
+   when its answer materially reduces implementation risk.
+4. Ask no more than three questions total.
+5. Never configure automatic resolution. When `request_user_input` is available, omit
+   `autoResolutionMs` entirely. If no interactive question tool is available, end the turn with the
+   unresolved questions and wait for the user.
+
+## Subagent review
+If a **SUBAGENT REVIEW** block appears, correct the serious issue before allowing that subagent to
+finish, or explicitly justify why the finding is inapplicable. Subagent reviews do not replace the
+main Stop-hook review of the final repository diff.
 
 ## Post-diff review (Stop hook)
 If a **POST-DIFF REVIEW** from Claude appears, address every serious issue (correctness, security,

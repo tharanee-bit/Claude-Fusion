@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/.codex/hooks/claude-fusion-userprompt.sh",
+            "command": "${PLUGIN_ROOT}/hooks/claude-fusion-userprompt.sh",
             "timeout": 660,
             "statusMessage": "Claude Fusion is analyzing the task read-only"
           }
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/.codex/hooks/claude-fusion-subagent-stop.sh",
+            "command": "${PLUGIN_ROOT}/hooks/claude-fusion-subagent-stop.sh",
             "timeout": 660,
             "statusMessage": "Claude Fusion is reviewing the subagent result read-only"
           }
@@ -29,7 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "$HOME/.codex/hooks/claude-fusion-stop.sh",
+            "command": "${PLUGIN_ROOT}/hooks/claude-fusion-stop.sh",
             "timeout": 660,
             "statusMessage": "Claude Fusion is reviewing the final diff read-only"
           }
