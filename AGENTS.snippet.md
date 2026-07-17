@@ -11,8 +11,9 @@ compatibility with older manual-install documentation.
 
 This environment runs **Claude Fusion**: on non-trivial coding prompts, Claude Code is consulted
 read-only and its analysis is injected as **AUTOMATIC CLAUDE FUSION CONTEXT**. After a complex,
-file-changing task, Claude reviews the `git diff` and may return an **AUTOMATIC CLAUDE FUSION -
-POST-DIFF REVIEW**.
+file-changing task, Claude reviews the final integration artifact (the active `git diff` plus any
+matching committed `codex-dw` ranges) and may return an **AUTOMATIC CLAUDE FUSION - POST-DIFF
+REVIEW**.
 
 When such a block appears:
 - Form your own plan first, then reconcile with Claude's: note consensus, disagreements,

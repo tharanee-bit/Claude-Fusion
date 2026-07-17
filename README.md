@@ -12,8 +12,10 @@ primary and Claude advises**. It uses Codex **hooks**:
   repo and injects Claude's independent analysis into Codex's context. Codex then reconciles its own
   plan with Claude's (consensus / disagreements / Claude-only insights) before touching code.
 - **After** Codex finishes a complex, file-changing task, a `Stop` hook runs Claude **read-only**
-  over the resulting `git diff`. If Claude flags serious problems (correctness, security, data-loss,
-  concurrency, broken tests), Codex is asked to address them before finalizing.
+  over the resulting `git diff` and any matching final integration ranges published by
+  [Codex Dynamic Workflows](https://github.com/tharanee-bit/Codex-Dynamic-Workflows). If Claude flags
+  serious problems (correctness, security, data-loss, concurrency, broken tests), Codex is asked to
+  address them before finalizing.
 - **Whenever a subagent finishes** under that gated parent turn, a `SubagentStop` hook reviews its
   capped final message and the filtered parent-turn diff when present. Research-only agents are
   included. Duplicate events are deduplicated and at most two unique subagents are reviewed by
@@ -44,10 +46,10 @@ Codex stays the editor and the final judge. Claude only advises and reviews - it
         +--> SubagentStop (up to 2 unique agents) --> PASS or continue that subagent
         |
         v
-   Stop hook -- task was complex AND git diff non-empty? --no--> (Codex finishes)
+   Stop hook -- active diff or matching codex-dw artifact? --no--> (Codex finishes)
         | yes
         v
-   claude -p  (read-only) over the diff
+   claude -p  (read-only) over the combined final artifact
         |
         +-- verdict PASS         --> Codex finishes
         +-- verdict ISSUES_FOUND --> Codex must address them first
@@ -55,13 +57,20 @@ Codex stays the editor and the final judge. Claude only advises and reviews - it
 ```
 
 The three hooks coordinate through small session-plus-turn marker files in
-`${TMPDIR:-/tmp}/claude-fusion-state-<uid>/`, so the Stop review only fires for tasks the UserPromptSubmit
-gate already judged complex. The marker records the prompt-time `HEAD`, and the Stop hook diffs the
-working tree against that commit, so work Codex commits mid-turn still gets reviewed. Each definitive
-review also stores a hash of the reviewed diff (an unchanged diff is not re-reviewed by a later gated
-prompt), and repeated transient review failures on the same diff stop after
-`CLAUDE_FUSION_STOP_RETRY_LIMIT` attempts. Legacy session-only markers remain readable during
-upgrades.
+`${TMPDIR:-/tmp}/claude-fusion-state-<uid>/`. The marker records the prompt-time `HEAD`, and the Stop
+hook diffs the working tree against that commit, so work Codex commits mid-turn still gets reviewed.
+On every ordinary Stop, the hook also scans `${CODEX_HOME:-$HOME/.codex}/dynamic-workflows/runs` for
+`codex-dw.review-artifact/v1` records bound to the current Codex session. This scan is independent of
+the prompt marker, so a detached workflow that finishes later is discovered on a subsequent turn.
+The hook strictly validates the repository, commit objects, integration branch tip, and ancestor
+range before including up to the four oldest unreviewed artifacts in the same Claude call as the
+active diff.
+
+Each definitive active review stores a diff hash, while workflow artifacts are receipted by stable
+artifact ID plus head commit. Unchanged inputs are not re-reviewed, and repeated transient failures
+on the same combined payload stop after `CLAUDE_FUSION_STOP_RETRY_LIMIT` attempts. Legacy
+session-only markers remain readable during upgrades. Invalid or unavailable artifact metadata is
+ignored fail-open; Claude Fusion never merges or modifies the integration branch.
 
 Claude Code clients that support `--output-format json` and `--json-schema` use validated JSON
 envelopes for both analysis and review. Non-success envelopes, `is_error`, malformed JSON, and
@@ -131,7 +140,7 @@ absolute paths in `--legacy` mode, so this caveat only applies to a manual merge
 | `[no-claude]` in your prompt | - | Skips Claude entirely for that prompt. |
 | `CLAUDE_FUSION_MODEL` | `fable` | Primary Claude model. Defaults to the latest Fable alias; overrides affect only the first attempt. |
 | `CLAUDE_FUSION_EFFORT` | `xhigh` | Primary reasoning effort (`low` / `medium` / `high` / `xhigh` / `max`); overrides affect only the first attempt. |
-| `CLAUDE_FUSION_DEPTH` | `workflow` | `workflow` = ask Claude for a deeper read-only analysis; `single` = one-shot analysis (faster). With the default safe mode, workflow stays isolated. |
+| `CLAUDE_FUSION_DEPTH` | `workflow` | `workflow` = ask Claude for a deeper read-only consultation; `single` = one-shot analysis (faster). This is Claude consultation depth, not the `codex-dw` runtime. With the default safe mode, it stays isolated. |
 | `CLAUDE_FUSION_TOOLS` | `readonly` | `readonly` = Claude can read/grep/glob + read-only git to explore the repo; `none` = `--tools ""` (analyze only the injected prompt + git status/diff). |
 | `CLAUDE_FUSION_SAFE_MODE` | `1` | `1` = run Claude with `--safe-mode`, preventing `CLAUDE.md`, memory, skills, plugins, workflows, MCP servers, and custom agents from leaking into the consult. If your Claude Code build does not support `--safe-mode`, the hook skips rather than falling back to custom context. `0` = allow local Claude customizations, including ultracode/dynamic workflows. |
 | `CLAUDE_FUSION_CONTINUITY` | `0` | `1` = persist and resume only the UserPromptSubmit Claude session. Invalid saved sessions are discarded and retried fresh. Stop and SubagentStop reviews always remain fresh. |
@@ -167,6 +176,12 @@ prompts and only skips when a prompt is clearly trivial or conversational - `[no
 verb. To make it conservative instead, edit the gate block in
 `plugins/claude-fusion/hooks/claude-fusion-userprompt.sh`.
 
+An explicit Dynamic Workflows prompt (`$dynamic-workflows`, `codex-dw`, `dynamic workflows`, or
+`ultracode`) changes Claude's role to workflow-design critic. Claude checks coverage, independent
+roles, budgets, barriers, authority, verification, stop gates, and terminal artifacts without
+launching duplicate Claude fan-out or a nested `codex-dw` run. Dynamic Workflows remains the
+orchestrator.
+
 ## Safety model
 
 - Claude always runs `--permission-mode plan` (it cannot edit files) and, by default,
@@ -184,6 +199,8 @@ verb. To make it conservative instead, edit the gate block in
   exclusion note. The prompt additionally tells Claude not to inspect credentials, but the guarantee
   is the source-level exclusion, not that instruction. Known limit: the filter is path-based, so if
   a turn renames a secret file to a non-denylisted name, the content appears under its new name.
+  Committed `codex-dw` ranges use the same path policy and per-file size cap, reading endpoint sizes
+  from Git objects so external integration branches do not need to be checked out.
 - All three hooks **never block** Codex on the no-action/failure path - they always exit 0. If Claude is missing,
   not logged in, times out, or errors, the hook silently skips. A `timeout` wrapper bounds every
   `claude` call so a hook can never hang Codex.
@@ -198,11 +215,14 @@ verb. To make it conservative instead, edit the gate block in
   and the bundled skill require Codex to inspect repo truth first, merge duplicates, ask all
   remaining required questions, and omit `autoResolutionMs` entirely. Without an interactive
   question tool, Codex ends the turn with the questions and waits.
-- **Loop-safe with Codex Fusion.** If you also run [Codex Fusion](https://github.com/tharanee-bit/Codex-Fusion) (Claude ->
-  Codex), Claude Fusion exports `CLAUDE_FUSION_ACTIVE=1` and `CODEX_FUSION_ACTIVE=1` when it calls
-  Claude and short-circuits at the top of every hook when either variable is set, so the inherited
-  environment breaks any claude<->codex hook loop. (Independently, `codex exec` - which Codex Fusion
-  uses - does not fire Codex lifecycle hooks.)
+- **Loop-safe with Codex Fusion and Dynamic Workflows.** If you also run
+  [Codex Fusion](https://github.com/tharanee-bit/Codex-Fusion) (Claude -> Codex), Claude Fusion
+  exports `CLAUDE_FUSION_ACTIVE=1` and `CODEX_FUSION_ACTIVE=1` when it calls Claude and
+  short-circuits at the top of every hook when either variable is set. Dynamic Workflows marks SDK
+  leaf workers with `CODEX_DW_ACTIVE=1`; Claude Fusion suppresses all lifecycle behavior in that
+  environment so worker execution cannot create nested, unbudgeted cross-model work. Native Codex
+  subagents keep the normal bounded `SubagentStop` behavior. (Independently, `codex exec` - which
+  Codex Fusion uses - does not fire Codex lifecycle hooks.)
 
 ## Test it
 
@@ -254,7 +274,7 @@ Other hooks and settings are untouched, and changed `hooks.json` files are backe
 
 ```
 .agents/plugins/marketplace.json                    # repo marketplace named claude-fusion
-plugins/claude-fusion/.codex-plugin/plugin.json     # v0.1.1 plugin manifest
+plugins/claude-fusion/.codex-plugin/plugin.json     # v0.1.2 plugin manifest
 plugins/claude-fusion/hooks/hooks.json              # default-discovered three-hook registration
 plugins/claude-fusion/hooks/*.sh                    # canonical runtime
 plugins/claude-fusion/skills/claude-fusion-auto/    # authoritative synthesis/question skill

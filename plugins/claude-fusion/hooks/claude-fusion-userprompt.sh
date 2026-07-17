@@ -111,8 +111,16 @@ fi
 GITSTATUS="$(clf_filtered_status "$CWD" | head -c 4000)"
 [ -n "$GITSTATUS" ] || GITSTATUS="(clean or not a git repository)"
 
+EXPLICIT_DW=0
+printf '%s' "$PROMPT" | grep -iqE '(\$dynamic-workflows\b|\bcodex-dw\b|\bdynamic[ -]workflows?\b|\bultracode\b)' && EXPLICIT_DW=1
 WF_NOTE=""
-if [ "$DEPTH" = "workflow" ] && [ "$CUSTOM_CLAUDE_CONTEXT" -eq 1 ]; then
+if [ "$EXPLICIT_DW" -eq 1 ]; then
+  WF_NOTE="
+Treat this explicit Dynamic Workflows request as a workflow-design review. Critique coverage, role
+independence, budgets, parallel barriers, authority boundaries, verification, stop gates, and the
+terminal artifact. Do not launch a duplicate Claude workflow, Task fan-out, or nested codex-dw run;
+the Codex/Dynamic Workflows coordinator owns execution."
+elif [ "$DEPTH" = "workflow" ] && [ "$CUSTOM_CLAUDE_CONTEXT" -eq 1 ]; then
   WF_NOTE="
 When the task is non-trivial, run a thorough READ-ONLY multi-agent analysis (dynamic workflows /
 parallel subagents) rather than a single quick pass. Do not edit files or run mutating commands."
@@ -124,7 +132,7 @@ skills, plugins, workflows, memory, MCP servers, or custom agents."
 fi
 
 CLAUDE_PREFIX=""
-[ "$DEPTH" = "workflow" ] && [ "$CUSTOM_CLAUDE_CONTEXT" -eq 1 ] && CLAUDE_PREFIX="ultracode: "
+[ "$EXPLICIT_DW" -eq 0 ] && [ "$DEPTH" = "workflow" ] && [ "$CUSTOM_CLAUDE_CONTEXT" -eq 1 ] && CLAUDE_PREFIX="ultracode: "
 CLAUDE_PROMPT="${CLAUDE_PREFIX}You are Claude acting as an independent coding peer for the OpenAI Codex agent.
 
 You are running automatically from a Codex UserPromptSubmit hook, in READ-ONLY mode.

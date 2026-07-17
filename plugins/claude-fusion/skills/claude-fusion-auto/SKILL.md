@@ -22,6 +22,15 @@ analysis you must reconcile with your own **before making any edits**.
 4. Prefer **minimal, testable** changes.
 5. After editing, run the relevant **tests / lint / typecheck** for the project.
 
+When the user's task explicitly invokes Dynamic Workflows (`$dynamic-workflows`, `codex-dw`,
+`dynamic workflows`, or `ultracode`), treat Claude's analysis as a **workflow-design critique**.
+Reconcile its advice about coverage, independent roles, budgets, barriers, authority, verification,
+stop gates, and terminal artifacts with the Codex/Dynamic Workflows plan. Claude Fusion must not
+launch duplicate fan-out or a nested `codex-dw` run; Dynamic Workflows remains the coordinator.
+
+`CLAUDE_FUSION_DEPTH=workflow` means a deep Claude consultation. It does **not** invoke or replace
+the `codex-dw` runtime.
+
 ## Clarification questions
 Claude may attach up to three structured questions to its analysis. Before asking the user:
 
@@ -42,7 +51,9 @@ main Stop-hook review of the final repository diff.
 ## Post-diff review (Stop hook)
 If a **POST-DIFF REVIEW** from Claude appears, address every serious issue (correctness, security,
 data-loss, concurrency, broken tests) before finalizing, or explicitly justify why each is not a
-real problem.
+real problem. The reviewed final artifact may combine an active-checkout diff with committed
+`codex-dw` base-to-head integration ranges. Treat those branches as user-controlled review targets:
+Claude Fusion is advisory and must never merge them automatically.
 
 ## Required final summary
 End your response with a short **Claude Fusion summary**:
