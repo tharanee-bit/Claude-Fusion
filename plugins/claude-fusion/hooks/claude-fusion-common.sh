@@ -75,7 +75,9 @@ clf_dbg() {
 clf_nested_fusion_active() {
   # Both Fusion directions set their flag before shelling out to the peer (env inherited through the
   # process tree); honoring either breaks any claude<->codex hook loop when both are installed.
-  [ "${CLAUDE_FUSION_ACTIVE:-0}" = "1" ] || [ "${CODEX_FUSION_ACTIVE:-0}" = "1" ]
+  # codex-dw marks every SDK leaf worker too, so workflow-owned lifecycle events cannot recursively
+  # trigger another cross-model consultation outside the parent workflow budget.
+  [ "${CLAUDE_FUSION_ACTIVE:-0}" = "1" ] || [ "${CODEX_FUSION_ACTIVE:-0}" = "1" ] || [ "${CODEX_DW_ACTIVE:-0}" = "1" ]
 }
 
 clf_setup_claude_runtime() {
@@ -261,6 +263,71 @@ clf_filtered_diff() {
     _fd_specs+=(":(literal)$_fd_f")
   done
   git -C "$_fd_top" diff "$_fd_base" -- "${_fd_specs[@]}" 2>/dev/null
+}
+
+clf_filtered_range_diff() {
+  # $1 = repository root, $2/$3 = validated full commit ids. Apply the same path and per-file size
+  # policy as the working-tree filter, but read sizes from Git objects because the integration range
+  # may live only on an external branch/worktree. A file is excluded if either endpoint blob exceeds
+  # the cap; deletions and additions therefore remain bounded too.
+  _fr_repo="$1"
+  _fr_base="$2"
+  _fr_head="$3"
+  _fr_files=()
+  _fr_excluded=0
+  while IFS= read -r -d '' _fr_f; do
+    if clf_sensitive_path "$_fr_f"; then
+      _fr_excluded=$((_fr_excluded + 1))
+      continue
+    fi
+    _fr_base_sz="$(git -C "$_fr_repo" cat-file -s "$_fr_base:$_fr_f" 2>/dev/null)"
+    _fr_head_sz="$(git -C "$_fr_repo" cat-file -s "$_fr_head:$_fr_f" 2>/dev/null)"
+    if [ "${_fr_base_sz:-0}" -gt "$CLF_MAX_FILE_BYTES" ] || [ "${_fr_head_sz:-0}" -gt "$CLF_MAX_FILE_BYTES" ]; then
+      _fr_excluded=$((_fr_excluded + 1))
+      continue
+    fi
+    _fr_files+=("$_fr_f")
+  done < <(git -C "$_fr_repo" diff --name-only -z "$_fr_base" "$_fr_head" -- 2>/dev/null)
+  [ "${#_fr_files[@]}" -gt 0 ] || return 1
+  [ "$_fr_excluded" -gt 0 ] && printf '### note: %s committed file(s) excluded (sensitive path or size cap)\n' "$_fr_excluded"
+  _fr_specs=()
+  for _fr_f in "${_fr_files[@]}"; do
+    _fr_specs+=(":(literal)$_fr_f")
+  done
+  git -C "$_fr_repo" diff "$_fr_base" "$_fr_head" -- "${_fr_specs[@]}" 2>/dev/null
+}
+
+clf_filtered_range_status() {
+  # Emit only reviewable committed path names. The range diff carries exact statuses; this compact
+  # summary deliberately omits sensitive and oversized names/content from the Claude payload.
+  _rs_repo="$1"
+  _rs_base="$2"
+  _rs_head="$3"
+  _rs_excluded=0
+  while IFS= read -r -d '' _rs_f; do
+    if clf_sensitive_path "$_rs_f"; then
+      _rs_excluded=$((_rs_excluded + 1))
+      continue
+    fi
+    _rs_base_sz="$(git -C "$_rs_repo" cat-file -s "$_rs_base:$_rs_f" 2>/dev/null)"
+    _rs_head_sz="$(git -C "$_rs_repo" cat-file -s "$_rs_head:$_rs_f" 2>/dev/null)"
+    if [ "${_rs_base_sz:-0}" -gt "$CLF_MAX_FILE_BYTES" ] || [ "${_rs_head_sz:-0}" -gt "$CLF_MAX_FILE_BYTES" ]; then
+      _rs_excluded=$((_rs_excluded + 1))
+      continue
+    fi
+    printf '%s\n' "$_rs_f"
+  done < <(git -C "$_rs_repo" diff --name-only -z "$_rs_base" "$_rs_head" -- 2>/dev/null)
+  [ "$_rs_excluded" -gt 0 ] && printf '[%s committed path(s) redacted by policy]\n' "$_rs_excluded"
+}
+
+clf_git_common_dir() {
+  # Compare this canonical path to recognize linked worktrees of the same repository without
+  # weakening the artifact repository binding.
+  _gc_repo="$1"
+  _gc_dir="$(git -C "$_gc_repo" rev-parse --git-common-dir 2>/dev/null)"
+  [ -n "$_gc_dir" ] || return 1
+  case "$_gc_dir" in /*) ;; *) _gc_dir="$_gc_repo/$_gc_dir";; esac
+  "$PY" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$_gc_dir" 2>/dev/null
 }
 
 clf_truncate_bytes() {

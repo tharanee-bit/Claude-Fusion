@@ -33,6 +33,7 @@ class HookTestCase(unittest.TestCase):
         self.home.mkdir()
         self.tmpdir.mkdir()
         self.repo.mkdir()
+        self.artifact_index = 0
         self._init_repo()
         self._write_fake_claude()
 
@@ -269,6 +270,7 @@ class HookTestCase(unittest.TestCase):
             if key.startswith(("CLAUDE_FUSION_", "CODEX_FUSION_", "FAKE_CLAUDE_", "FAKE_CODEX_")) or key in (
                 "CLAUDE_FUSION_ACTIVE",
                 "CODEX_FUSION_ACTIVE",
+                "CODEX_DW_ACTIVE",
                 "CODEX_HOME",
             ):
                 env.pop(key)
@@ -358,6 +360,113 @@ class HookTestCase(unittest.TestCase):
             ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True, capture_output=True, check=True
         ).stdout.strip()
 
+    def artifact_root(self):
+        return self.home / ".codex" / "dynamic-workflows" / "runs"
+
+    def artifact_receipts(self, session):
+        receipt_file = self.state_file(session, "dw-reviewed")
+        if not receipt_file.exists():
+            return set()
+        return {
+            tuple(line.split("\t", 1))
+            for line in receipt_file.read_text(encoding="utf-8").splitlines()
+            if "\t" in line
+        }
+
+    def write_artifact_state(self, artifact, run_id=None):
+        if run_id is None:
+            self.artifact_index += 1
+            run_id = f"run-{self.artifact_index:02d}"
+        run_dir = self.artifact_root() / run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        state = {
+            "schemaVersion": 1,
+            "id": run_id,
+            "status": artifact["runStatus"],
+            "workflowPath": "/tmp/fake-cross-repo-acceptance.yaml",
+            "workflowHash": "fixture-hash",
+            "workflowKind": "declarative",
+            "workflowSnapshot": "apiVersion: codex.openai.com/v1alpha1\nkind: Workflow\n",
+            "args": {},
+            "workingDirectory": str(self.repo),
+            "profile": "small",
+            "maxAgents": 4,
+            "agentCallsUsed": 1,
+            "concurrency": 4,
+            "allowMutation": True,
+            "createdAt": artifact["publishedAt"],
+            "updatedAt": artifact["publishedAt"],
+            "completedAt": artifact["publishedAt"],
+            "usage": {
+                "inputTokens": 0,
+                "cachedInputTokens": 0,
+                "outputTokens": 0,
+                "reasoningOutputTokens": 0,
+            },
+            "calls": {},
+            "phases": {},
+            "outputs": {},
+            "git": {
+                "repositoryRoot": artifact["repositoryRoot"],
+                "baseHead": artifact["baseCommit"],
+                "activeBranch": "main",
+                "statusPorcelain": "",
+                "runKey": run_id,
+                "worktreeRoot": artifact["repositoryRoot"],
+                "runWorktreeRoot": artifact["repositoryRoot"],
+                "integrationBranch": artifact["branch"],
+                "integrationWorktree": artifact["repositoryRoot"],
+                "integrationHead": artifact["headCommit"],
+                "integratedPaths": [],
+                "pathOwners": {},
+            },
+            "reviewArtifacts": [artifact],
+        }
+        (run_dir / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        return run_dir / "state.json"
+
+    def create_artifact(
+        self,
+        session,
+        artifact_id,
+        *,
+        files=None,
+        branch=None,
+        status="completed",
+        published_at=None,
+        base=None,
+        publish=True,
+    ):
+        """Commit a producer-like integration range while leaving the active checkout clean."""
+        self.artifact_index += 1
+        sequence = self.artifact_index
+        branch = branch or f"codex-dw/{sequence:02d}-{artifact_id.replace('.', '-')}"
+        base = base or self.head_sha()
+        subprocess.run(["git", "switch", "-c", branch, base], cwd=self.repo, check=True, stdout=subprocess.DEVNULL)
+        files = files or {f"artifact-{sequence:02d}.txt": f"external integration change {artifact_id}\n"}
+        for path, content in files.items():
+            target = self.repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content, encoding="utf-8")
+        self.commit_all(f"integration artifact {artifact_id}")
+        head = self.head_sha()
+        subprocess.run(["git", "switch", "main"], cwd=self.repo, check=True, stdout=subprocess.DEVNULL)
+        artifact = {
+            "protocol": "codex-dw.review-artifact/v1",
+            "id": artifact_id,
+            "reviewSessionId": session,
+            "kind": "git-range",
+            "repositoryRoot": str(self.repo),
+            "baseCommit": base,
+            "headCommit": head,
+            "branch": branch,
+            "runStatus": status,
+            "publishedAt": published_at or f"2026-07-17T12:{sequence:02d}:00.000Z",
+        }
+        if publish:
+            self.write_artifact_state(artifact, run_id=f"artifact-run-{sequence:02d}")
+        return artifact
+
     def test_gate_triggers_and_injects_context(self):
         res = self.run_hook(
             USERPROMPT_HOOK, {"prompt": GATED_PROMPT, "cwd": str(self.repo), "session_id": "gate"}
@@ -407,6 +516,52 @@ class HookTestCase(unittest.TestCase):
         final = self.stop("skipgate")
         self.assertEqual((sub.stdout, final.stdout), ("", ""))
         self.assertEqual(self.consults(), [], "[no-claude] parent turns suppress subagent and final reviews")
+
+    def test_dynamic_workflow_prompt_gets_design_critic_without_duplicate_fanout(self):
+        res = self.run_hook(
+            USERPROMPT_HOOK,
+            {
+                "prompt": "Use codex-dw to implement this migration with bounded workers",
+                "cwd": str(self.repo),
+                "session_id": "workflow-critic",
+            },
+            CLAUDE_FUSION_SAFE_MODE="0",
+            CLAUDE_FUSION_DEPTH="workflow",
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        consult = self.consults()[0]
+        self.assertFalse(consult["prompt"].startswith("ultracode: "))
+        self.assertIn("workflow-design review", consult["prompt"])
+        self.assertIn("coverage, role", consult["prompt"])
+        self.assertIn("budgets, parallel barriers, authority boundaries", consult["prompt"])
+        self.assertIn("verification, stop gates, and the", consult["prompt"])
+        self.assertIn("terminal artifact", consult["prompt"])
+        self.assertIn("Do not launch a duplicate Claude workflow", consult["prompt"])
+        self.assertIn("nested codex-dw run", consult["prompt"])
+
+    def test_codex_dw_worker_environment_suppresses_all_lifecycle_hooks(self):
+        artifact = self.create_artifact("dw-worker", "worker-artifact")
+        prompt = self.run_hook(
+            USERPROMPT_HOOK,
+            {"prompt": GATED_PROMPT, "cwd": str(self.repo), "session_id": "dw-worker"},
+            CODEX_DW_ACTIVE="1",
+        )
+        subagent = self.run_hook(
+            SUBAGENT_STOP_HOOK,
+            {
+                "cwd": str(self.repo),
+                "session_id": "dw-worker",
+                "agent_id": "worker-child",
+                "last_assistant_message": "result",
+            },
+            CODEX_DW_ACTIVE="1",
+        )
+        stop = self.stop("dw-worker", CODEX_DW_ACTIVE="1")
+        for result in (prompt, subagent, stop):
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+        self.assertEqual(self.consults(), [])
+        self.assertNotIn((artifact["id"], artifact["headCommit"]), self.artifact_receipts("dw-worker"))
 
     def test_marker_lifecycle_pass_consumes_marker(self):
         self.gate("pass")
@@ -679,6 +834,180 @@ class HookTestCase(unittest.TestCase):
         self.assertIn("+committed change", consults[0]["prompt"])
         self.assertFalse(self.marker("midcommit").exists())
         self.assertTrue(self.state_file("midcommit", "reviewed").exists())
+
+    def test_cross_repo_contract_reviews_committed_range_with_clean_active_checkout(self):
+        artifact = self.create_artifact(
+            "artifact-clean",
+            "clean-integration",
+            files={"external.txt": "CHANGE_VISIBLE_ONLY_ON_INTEGRATION_BRANCH\n"},
+        )
+        self.assertEqual(
+            subprocess.run(
+                ["git", "status", "--porcelain"], cwd=self.repo, text=True, capture_output=True, check=True
+            ).stdout,
+            "",
+        )
+
+        res = self.stop("artifact-clean")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout, "")
+        self.assertEqual(len(self.consults()), 1)
+        prompt = self.consults()[0]["prompt"]
+        self.assertIn("codex-dw review artifact clean-integration", prompt)
+        self.assertIn("CHANGE_VISIBLE_ONLY_ON_INTEGRATION_BRANCH", prompt)
+        self.assertIn((artifact["id"], artifact["headCommit"]), self.artifact_receipts("artifact-clean"))
+
+    def test_stop_combines_active_checkout_and_external_artifact_in_one_call(self):
+        artifact = self.create_artifact(
+            "artifact-combined",
+            "combined-integration",
+            files={"external.txt": "EXTERNAL_RANGE_CHANGE\n"},
+        )
+        self.gate("artifact-combined")
+        self.modify_repo("hello\nACTIVE_CHECKOUT_CHANGE\n")
+
+        res = self.stop("artifact-combined")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(len(self.consults()), 1)
+        prompt = self.consults()[0]["prompt"]
+        self.assertIn("### active checkout diff", prompt)
+        self.assertIn("ACTIVE_CHECKOUT_CHANGE", prompt)
+        self.assertIn("### codex-dw review artifact combined-integration", prompt)
+        self.assertIn("EXTERNAL_RANGE_CHANGE", prompt)
+        self.assertIn((artifact["id"], artifact["headCommit"]), self.artifact_receipts("artifact-combined"))
+
+    def test_artifact_session_repository_and_ref_mismatches_are_rejected(self):
+        cases = ("session", "repository", "ref", "branch-tip")
+        for case in cases:
+            with self.subTest(case=case):
+                session = f"reject-{case}"
+                artifact = self.create_artifact(session, f"invalid-{case}", publish=False)
+                if case == "session":
+                    artifact["reviewSessionId"] = "different-session"
+                elif case == "repository":
+                    artifact["repositoryRoot"] = str(self.base)
+                elif case == "ref":
+                    artifact["headCommit"] = "f" * 40
+                else:
+                    artifact["branch"] = "main"
+                self.write_artifact_state(artifact, run_id=f"invalid-state-{case}")
+                self.clear_log()
+                res = self.stop(session)
+                self.assertEqual(res.returncode, 0, res.stderr)
+                self.assertEqual(res.stdout, "")
+                self.assertEqual(self.consults(), [])
+                self.assertEqual(self.artifact_receipts(session), set())
+
+    def test_artifact_range_uses_sensitive_path_filter(self):
+        artifact = self.create_artifact(
+            "artifact-sensitive",
+            "sensitive-integration",
+            files={
+                "safe.txt": "SAFE_COMMITTED_CHANGE\n",
+                ".env": "TOKEN=COMMITTED_SECRET_MUST_NOT_LEAK\n",
+            },
+        )
+        res = self.stop("artifact-sensitive")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        prompt = self.consults()[0]["prompt"]
+        self.assertIn("SAFE_COMMITTED_CHANGE", prompt)
+        self.assertIn("committed file(s) excluded", prompt)
+        self.assertNotIn("COMMITTED_SECRET_MUST_NOT_LEAK", prompt)
+        self.assertNotIn("diff --git a/.env", prompt)
+        self.assertIn((artifact["id"], artifact["headCommit"]), self.artifact_receipts("artifact-sensitive"))
+
+    def test_artifact_batch_reviews_four_oldest_then_next(self):
+        artifacts = []
+        for index in range(5):
+            artifacts.append(
+                self.create_artifact(
+                    "artifact-batch",
+                    f"batch-{index}",
+                    files={f"batch-{index}.txt": f"BATCH_CHANGE_{index}\n"},
+                    status=("completed", "failed", "stopped", "completed", "failed")[index],
+                    published_at=f"2026-07-17T12:0{index}:00.000Z",
+                )
+            )
+
+        first = self.stop("artifact-batch")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(len(self.consults()), 1)
+        first_prompt = self.consults()[0]["prompt"]
+        for index in range(4):
+            self.assertIn(f"BATCH_CHANGE_{index}", first_prompt)
+        self.assertNotIn("BATCH_CHANGE_4", first_prompt)
+        self.assertEqual(
+            self.artifact_receipts("artifact-batch"),
+            {(artifact["id"], artifact["headCommit"]) for artifact in artifacts[:4]},
+        )
+
+        self.clear_log()
+        second = self.stop("artifact-batch")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(len(self.consults()), 1)
+        self.assertIn("BATCH_CHANGE_4", self.consults()[0]["prompt"])
+        self.assertEqual(
+            self.artifact_receipts("artifact-batch"),
+            {(artifact["id"], artifact["headCommit"]) for artifact in artifacts},
+        )
+
+    def test_artifact_receipt_deduplicates_id_and_head_but_new_head_is_reviewed(self):
+        first = self.create_artifact("artifact-dedupe", "stable-artifact")
+        res = self.stop("artifact-dedupe")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertIn((first["id"], first["headCommit"]), self.artifact_receipts("artifact-dedupe"))
+
+        subprocess.run(["git", "switch", first["branch"]], cwd=self.repo, check=True, stdout=subprocess.DEVNULL)
+        (self.repo / "follow-up.txt").write_text("NEW_HEAD_CHANGE\n", encoding="utf-8")
+        self.commit_all("advance integration artifact")
+        new_head = self.head_sha()
+        subprocess.run(["git", "switch", "main"], cwd=self.repo, check=True, stdout=subprocess.DEVNULL)
+        advanced = dict(first, headCommit=new_head, publishedAt="2026-07-17T13:00:00.000Z")
+        self.write_artifact_state(advanced, run_id="advanced-artifact")
+
+        self.clear_log()
+        res = self.stop("artifact-dedupe")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(len(self.consults()), 1)
+        self.assertIn("NEW_HEAD_CHANGE", self.consults()[0]["prompt"])
+        self.assertIn((first["id"], new_head), self.artifact_receipts("artifact-dedupe"))
+
+    def test_artifact_issues_block_and_transient_failure_retries_without_receipt(self):
+        issue = self.create_artifact("artifact-issue", "issue-artifact")
+        blocked = self.stop("artifact-issue", FAKE_CLAUDE_VERDICT="ISSUES_FOUND")
+        self.assertEqual(blocked.returncode, 0, blocked.stderr)
+        payload = json.loads(blocked.stdout)
+        self.assertEqual(payload["decision"], "block")
+        self.assertIn("final integration artifact", payload["reason"])
+        self.assertIn((issue["id"], issue["headCommit"]), self.artifact_receipts("artifact-issue"))
+
+        retry = self.create_artifact("artifact-retry", "retry-artifact")
+        self.clear_log()
+        failed = self.stop("artifact-retry", FAKE_CLAUDE_RC="1")
+        self.assertEqual(failed.returncode, 0, failed.stderr)
+        self.assertEqual(failed.stdout, "")
+        self.assertNotIn((retry["id"], retry["headCommit"]), self.artifact_receipts("artifact-retry"))
+        self.clear_log()
+        passed = self.stop("artifact-retry")
+        self.assertEqual(passed.returncode, 0, passed.stderr)
+        self.assertEqual(len(self.consults()), 1)
+        self.assertIn((retry["id"], retry["headCommit"]), self.artifact_receipts("artifact-retry"))
+
+    def test_detached_artifact_is_discovered_on_later_stop(self):
+        first = self.stop("artifact-later")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(self.consults(), [])
+
+        artifact = self.create_artifact(
+            "artifact-later",
+            "later-artifact",
+            files={"later.txt": "DETACHED_COMPLETION_DISCOVERED_LATER\n"},
+        )
+        second = self.stop("artifact-later")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(len(self.consults()), 1)
+        self.assertIn("DETACHED_COMPLETION_DISCOVERED_LATER", self.consults()[0]["prompt"])
+        self.assertIn((artifact["id"], artifact["headCommit"]), self.artifact_receipts("artifact-later"))
 
     def test_stop_hook_active_loop_guard(self):
         self.gate("loop")
@@ -1081,7 +1410,7 @@ class HookTestCase(unittest.TestCase):
 
         manifest = json.loads((PLUGIN_ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["name"], "claude-fusion")
-        self.assertEqual(manifest["version"], "0.1.1")
+        self.assertEqual(manifest["version"], "0.1.2")
         self.assertEqual(manifest["license"], "MIT")
         self.assertIn("Read-only analysis", manifest["interface"]["capabilities"])
         self.assertNotIn("hooks", manifest, "hooks/hooks.json must be found through default discovery")
