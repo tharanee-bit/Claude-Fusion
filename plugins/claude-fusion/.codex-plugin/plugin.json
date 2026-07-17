@@ -1,6 +1,6 @@
 {
   "name": "claude-fusion",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Automatically consults Claude Code through synchronous, read-only Codex hooks for planning and review.",
   "author": {
     "name": "tharanee-bit",

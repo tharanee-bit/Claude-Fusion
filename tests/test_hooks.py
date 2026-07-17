@@ -117,7 +117,8 @@ class HookTestCase(unittest.TestCase):
                 rc = int(os.environ.get("FAKE_CLAUDE_RC", "0") or "0")
                 if rc:
                     sys.exit(rc)
-                delay = float(os.environ.get("FAKE_CLAUDE_SLEEP", "0") or "0")
+                model_delay = os.environ.get("FAKE_CLAUDE_SLEEP_" + (arg_value("--model") or "").upper())
+                delay = float(model_delay if model_delay is not None else (os.environ.get("FAKE_CLAUDE_SLEEP", "0") or "0"))
                 if delay:
                     time.sleep(delay)
                 if os.environ.get("FAKE_CLAUDE_EMPTY") == "1":
@@ -465,10 +466,28 @@ class HookTestCase(unittest.TestCase):
         self.clear_log()
         self.gate("slow")
         self.modify_repo("hello\nslow change\n")
-        res = self.stop("slow", FAKE_CLAUDE_SLEEP="3", CLAUDE_FUSION_TIMEOUT="1")
+        res = self.stop("slow", FAKE_CLAUDE_SLEEP="3", CLAUDE_FUSION_TIMEOUT="2")
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertEqual(len(self.consults()), 1)
         self.assertTrue(self.marker("slow").exists(), "marker must be kept for retry after a timeout")
+
+    def test_structured_retries_share_one_hook_budget(self):
+        self.gate("budget")
+        self.modify_repo("hello\nbudgeted change\n")
+        res = self.stop(
+            "budget",
+            FAKE_CLAUDE_MALFORMED="1",
+            FAKE_CLAUDE_SLEEP_OPUS="3",
+            CLAUDE_FUSION_TIMEOUT="2",
+        )
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(
+            [entry["model"] for entry in self.consults()],
+            ["fable", "opus"],
+            "the timed-out fallback must consume the shared budget before a final text attempt starts",
+        )
+        self.assertTrue(self.marker("budget").exists())
+        self.assertTrue(self.state_file("budget", "failed-review").exists())
 
     def test_safe_mode_fail_closed(self):
         res = self.run_hook(
@@ -593,6 +612,22 @@ class HookTestCase(unittest.TestCase):
         self.assertEqual(self.read_log(), [], "unchanged reviewed diff must not consult claude again")
         self.assertFalse(self.marker("hashskip").exists())
 
+    def test_reviewed_hash_skips_unchanged_diff_across_turn_ids(self):
+        self.gate("hashskip-turn", turn="one")
+        self.modify_repo()
+        res = self.stop("hashskip-turn", turn="one")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(len(self.consults()), 1)
+        self.assertTrue(self.state_file("hashskip-turn", "reviewed").exists())
+
+        self.clear_log()
+        self.gate("hashskip-turn", turn="two")
+        self.assertTrue(self.marker("hashskip-turn", "two").exists())
+        res = self.stop("hashskip-turn", turn="two")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(self.read_log(), [], "a new turn_id must not re-review the unchanged session diff")
+        self.assertFalse(self.marker("hashskip-turn", "two").exists())
+
     def test_retry_cap_bounds_failed_reviews(self):
         self.gate("cap")
         self.modify_repo()
@@ -611,6 +646,27 @@ class HookTestCase(unittest.TestCase):
         third = self.stop("cap", **extra)
         self.assertEqual(third.returncode, 0, third.stderr)
         self.assertEqual(self.read_log(), [], "retry cap must stop consulting for an unchanged diff")
+
+    def test_retry_cap_bounds_failed_reviews_across_turn_ids(self):
+        self.gate("cap-turn", turn="one")
+        self.modify_repo()
+        extra = {"FAKE_CLAUDE_RC": "1", "CLAUDE_FUSION_STOP_RETRY_LIMIT": "2"}
+
+        first = self.stop("cap-turn", turn="one", **extra)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(len(self.consults()), 3)
+        self.clear_log()
+
+        self.gate("cap-turn", turn="two")
+        second = self.stop("cap-turn", turn="two", **extra)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(len(self.consults()), 3)
+        self.clear_log()
+
+        self.gate("cap-turn", turn="three")
+        third = self.stop("cap-turn", turn="three", **extra)
+        self.assertEqual(third.returncode, 0, third.stderr)
+        self.assertEqual(self.read_log(), [], "a new turn_id must not reset the session retry cap")
 
     def test_commit_during_turn_still_reviewed(self):
         self.gate("midcommit")
@@ -857,7 +913,8 @@ class HookTestCase(unittest.TestCase):
         self.clear_log()
         second = self.stop("turns", turn="two")
         self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertEqual(len(self.consults()), 1, "a separate parent turn must receive its own final review")
+        self.assertEqual(self.consults(), [], "the isolated second marker must still honor session diff deduplication")
+        self.assertFalse(self.marker("turns", "two").exists())
 
         state = self.state_dir()
         state.mkdir(mode=0o700, exist_ok=True)
@@ -1024,7 +1081,7 @@ class HookTestCase(unittest.TestCase):
 
         manifest = json.loads((PLUGIN_ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["name"], "claude-fusion")
-        self.assertEqual(manifest["version"], "0.1.0")
+        self.assertEqual(manifest["version"], "0.1.1")
         self.assertEqual(manifest["license"], "MIT")
         self.assertIn("Read-only analysis", manifest["interface"]["capabilities"])
         self.assertNotIn("hooks", manifest, "hooks/hooks.json must be found through default discovery")
@@ -1087,6 +1144,26 @@ class HookTestCase(unittest.TestCase):
         self.assertNotEqual(failed.returncode, 0)
         self.assertEqual(hooks_file.read_bytes(), before, "failed plugin verification must not strip legacy hooks")
         self.assertTrue((self.home / ".codex" / "hooks" / "claude-fusion-userprompt.sh").exists())
+
+    def test_failed_legacy_cleanup_preserves_files_and_rolls_back_plugin(self):
+        state = self._write_fake_codex()
+        env = self.env(FAKE_CODEX_STATE=str(state))
+        legacy = subprocess.run(
+            [str(INSTALL), "--legacy"], cwd=ROOT, text=True, capture_output=True, env=env, timeout=30
+        )
+        self.assertEqual(legacy.returncode, 0, legacy.stdout + legacy.stderr)
+        hooks_file = self.home / ".codex" / "hooks.json"
+        before = hooks_file.read_bytes()
+        (Path(str(hooks_file) + ".claude-fusion.bak") / "hooks.json").mkdir(parents=True)
+
+        failed = subprocess.run(
+            [str(INSTALL), "--local"], cwd=ROOT, text=True, capture_output=True, env=env, timeout=30
+        )
+        self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+        self.assertEqual(hooks_file.read_bytes(), before)
+        self.assertTrue((self.home / ".codex" / "hooks" / "claude-fusion-userprompt.sh").exists())
+        self.assertFalse(json.loads(state.read_text(encoding="utf-8"))["installed"])
+        self.assertIn("legacy files were preserved", failed.stderr)
 
     def test_remote_install_uses_github_marketplace_source(self):
         state = self._write_fake_codex()

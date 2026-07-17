@@ -67,10 +67,10 @@ try:
     valid = valid and all("${PLUGIN_ROOT}/hooks/claude-fusion-" in commands[e][0].get("command", "") for e in expected)
     valid = valid and all(commands[e][0].get("statusMessage") for e in expected)
     report("PASS" if valid else "FAIL", "plugin hooks register exactly UserPromptSubmit, SubagentStop, and Stop through ${PLUGIN_ROOT}")
-    internal_max = 600
+    internal_max = 630
     timeouts = [commands[e][0].get("timeout", 0) for e in expected]
     report("PASS" if all(isinstance(t, int) and t > internal_max for t in timeouts) else "FAIL",
-           "hook registration timeouts exceed the maximum default internal timeout")
+           "hook registration timeouts exceed the maximum shared internal budget")
 except Exception as exc:
     report("FAIL", f"plugin hooks manifest is invalid: {exc}")
 
