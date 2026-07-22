@@ -162,7 +162,13 @@ clf_probe_capabilities() {
   # key is the resolved binary plus mtime:size, so Claude Code upgrades re-probe automatically.
   # Never cache an empty/crashed probe: a transient failure must not disable features permanently.
   _sm_real="$("$PY" -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$CLAUDE_BIN" 2>/dev/null || printf '%s' "$CLAUDE_BIN")"
-  _sm_stat="$(stat -c '%Y:%s' "$_sm_real" 2>/dev/null)"
+  # Use Python rather than GNU/BSD-specific stat flags. macOS provides BSD stat, where `stat -c`
+  # fails and used to collapse every binary version to the same `nostat` cache key.
+  _sm_stat="$("$PY" -c '
+import os, sys
+value = os.stat(sys.argv[1])
+print(f"{value.st_mtime_ns}:{value.st_size}")
+' "$_sm_real" 2>/dev/null)"
   _sm_key="$_sm_real|${_sm_stat:-nostat}"
   _sm_cache="$STATE_DIR/claude-caps"
   if clf_ensure_state_dir && [ -f "$_sm_cache" ]; then

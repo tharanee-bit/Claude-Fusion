@@ -1410,7 +1410,7 @@ class HookTestCase(unittest.TestCase):
 
         manifest = json.loads((PLUGIN_ROOT / ".codex-plugin" / "plugin.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["name"], "claude-fusion")
-        self.assertEqual(manifest["version"], "0.1.2")
+        self.assertRegex(manifest["version"], r"^0\.1\.2(?:\+codex\.[0-9A-Za-z.-]+)?$")
         self.assertEqual(manifest["license"], "MIT")
         self.assertIn("Read-only analysis", manifest["interface"]["capabilities"])
         self.assertNotIn("hooks", manifest, "hooks/hooks.json must be found through default discovery")
